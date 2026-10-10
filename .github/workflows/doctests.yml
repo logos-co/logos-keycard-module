@@ -1,0 +1,89 @@
+name: keycard-module Doc-Tests
+
+# Runs this repo's executable doc-test end-to-end via the shared `doctest` CLI
+# (github:logos-co/logos-doctest) on every PR and push to main, against a simulated Keycard, and
+# keeps the rendered report as an artifact.
+
+on:
+  pull_request:
+    branches: [master, main]
+  push:
+    branches: [master, main]
+
+concurrency:
+  group: doctests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  doctests:
+    name: keycard-module doc-tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    # ATTIC_TOKEN_PUBLIC only exists in the public-cache environment; main
+    # jobs must opt into it to publish to the public cache.
+    environment: ${{ github.ref == 'refs/heads/main' && 'public-cache' || '' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix and set up the shared cache
+        uses: logos-co/setup-nix-cache-action@v1
+        with:
+          attic-token-ci: ${{ secrets.ATTIC_TOKEN_CI }}
+          attic-token-public: ${{ secrets.ATTIC_TOKEN_PUBLIC }}
+          # Keep READING the old Cachix while the Attic caches fill up. The
+          # rust crate derivations this build needs are in Cachix and in no
+          # other cache -- so dropping it outright did not just cost cache
+          # hits, it turned "substitute a prebuilt path" into "build it from
+          # source", which fails. Credential-free: the cache is public, and
+          # nothing publishes here any more. Remove once Attic has the paths.
+          extra-nix-config: |
+            extra-substituters = https://logos-co.cachix.org
+            extra-trusted-public-keys = logos-co.cachix.org-1:12K8609ho1pCt0erUQrOrs/KmOuhWq/EhVwhzQRb35E=
+
+      # The commit under test. For PRs it's the head commit (so the spec's
+      # `{release}` placeholder resolves to THIS PR's code, not main). Fork PRs
+      # blank it (their head isn't in this repo) so the run falls back to main.
+      - name: Resolve commit under test
+        id: commit
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ] && \
+             [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
+            echo "sha=" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=${{ github.event.pull_request.head.sha || github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run doc-tests
+        run: |
+          nix run github:logos-co/logos-doctest -- run \
+            doctests/keycard-runtime.test.yaml \
+            --verbose \
+            --continue-on-fail \
+            --release-for logos-keycard-module=${{ steps.commit.outputs.sha }} \
+            --report "${{ runner.temp }}/doctest-report.html"
+
+      - name: Stage report for upload
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p report-out
+          if [ -f "${{ runner.temp }}/doctest-report.html" ]; then
+            cp "${{ runner.temp }}/doctest-report.html" report-out/index.html
+          else
+            echo "<h1>No report produced</h1>" > report-out/index.html
+          fi
+
+      - name: Upload execution report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: doctest-report-${{ matrix.os }}
+          path: report-out/index.html
+          if-no-files-found: warn

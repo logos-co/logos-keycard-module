@@ -1,0 +1,39 @@
+{
+  "name": "keycard_module",
+  "version": "0.1.0",
+  "description": "Keycard signer: the accounts the person offered from a bare Keycard in a smart-card reader, and the hashes the signer manager computes, signed once the card's PIN opens it. Holds no secret but a 3.x card's pairing.",
+  "author": "Logos Core Team",
+  "type": "core",
+  "interface": "cdylib",
+  "concurrency": "multi",
+  "category": "wallet",
+  "main": "keycard_module_plugin",
+  "dependencies": [],
+  "include": [],
+  "capabilities": [],
+  "codegen": {
+    "rust": {
+      "crate": "rust-lib",
+      "trait": "KeycardModule",
+      "source": "src/glue.rs"
+    }
+  },
+  "nix": {
+    "external_libraries": [],
+    "packages": {
+      "build": [],
+      "runtime": []
+    },
+    "cmake": {
+      "find_packages": [],
+      "extra_include_dirs": []
+    },
+    "platforms": [
+      {
+        "when": { "os": "linux" },
+        "packages": { "runtime": ["pcsclite"] },
+        "rust": { "packages": { "build": ["pkg-config"], "runtime": ["pcsclite"] } }
+      }
+    ]
+  }
+}
