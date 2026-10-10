@@ -6,7 +6,7 @@ use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
 use keycard_rs::parsing::Mnemonic;
 use keycard_rs::{ApduResponse, KeycardCommandSet, SecureChannelVersion};
 
-use crate::link::{Simulator, TcpLink, SIMULATOR_CA};
+use crate::link::TcpLink;
 
 /// The applet tests' CA key, which signs simulated cards' identities only.
 const TEST_CA_SECRET: [u8; 32] = [
@@ -16,6 +16,11 @@ const TEST_CA_SECRET: [u8; 32] = [
 
 /// The simulated card's identity key; a real card makes its own at the factory.
 const IDENTITY_SECRET: [u8; 32] = [0x1d; 32];
+
+/// Another CA, which the simulator link doesn't trust, and the identity it signs: a card Keycard
+/// didn't sign, such as one a person loaded the applet onto.
+pub const OTHER_CA_SECRET: [u8; 32] = [0x5a; 32];
+pub const OTHER_IDENTITY_SECRET: [u8; 32] = [0x2b; 32];
 
 /// The Keycard applet's instance, and the identity applet's, where a 4.0 card's certificate is.
 const KEYCARD_AID: [u8; 9] = [0xa0, 0x00, 0x00, 0x08, 0x04, 0x00, 0x01, 0x01, 0x01];
@@ -34,6 +39,10 @@ pub struct Setup {
     pub pairing_password: String,
     /// The key to load; `None` leaves the card without one.
     pub phrase: Option<String>,
+    /// The CA that signs a 4.0 card's identity, and the identity's own key: by default the test
+    /// CA the simulator link trusts, so another CA makes a card Keycard didn't sign.
+    pub ca: [u8; 32],
+    pub identity: [u8; 32],
 }
 
 impl Default for Setup {
@@ -43,6 +52,8 @@ impl Default for Setup {
             puk: "987654321098".into(),
             pairing_password: "KeycardDefaultPairing".into(),
             phrase: Some(TEST_PHRASE.into()),
+            ca: TEST_CA_SECRET,
+            identity: IDENTITY_SECRET,
         }
     }
 }
@@ -66,19 +77,23 @@ pub fn fresh(addr: &str) -> Result<(), String> {
         .exchange(&[0xff, 0x7f, 0, 0])
         .map_err(io)?;
     if r == [0x90, 0x00] {
-        Simulator::inserted_again(addr);
         Ok(())
     } else {
         Err(format!("the simulator answered {}", hex::encode(r)))
     }
 }
 
-/// The certificate the test CA gives the simulated card: its identity key, compressed, then the
-/// CA's recoverable signature over that key's SHA-256.
+/// The certificate the test CA gives the simulated card.
 pub fn certificate() -> [u8; 98] {
+    certificate_by(&TEST_CA_SECRET, &IDENTITY_SECRET)
+}
+
+/// The certificate `ca` gives the identity key `identity`: that key, compressed, then the CA's
+/// recoverable signature over its SHA-256.
+pub fn certificate_by(ca: &[u8; 32], identity: &[u8; 32]) -> [u8; 98] {
     let secp = Secp256k1::new();
-    let ident = SecretKey::from_slice(&IDENTITY_SECRET).expect("a valid key");
-    let ca = SecretKey::from_slice(&TEST_CA_SECRET).expect("a valid key");
+    let ident = SecretKey::from_slice(identity).expect("a valid key");
+    let ca = SecretKey::from_slice(ca).expect("a valid key");
     let public = ident.public_key(&secp).serialize();
     let digest = sha256::Hash::hash(&public).to_byte_array();
     let (id, rs) = secp
@@ -111,8 +126,8 @@ pub fn personalize(addr: &str, setup: &Setup) -> Result<(), String> {
             return Err(format!("selecting the identity applet: {}", hex::encode(r)));
         }
         let mut store = vec![0x80, 0xe2, 0x00, 0x00, 130];
-        store.extend_from_slice(&certificate());
-        store.extend_from_slice(&IDENTITY_SECRET);
+        store.extend_from_slice(&certificate_by(&setup.ca, &setup.identity));
+        store.extend_from_slice(&setup.identity);
         let r = raw.exchange(&store).map_err(io)?;
         if r != [0x90, 0x00] {
             return Err(format!("storing the identity: {}", hex::encode(r)));
@@ -120,7 +135,11 @@ pub fn personalize(addr: &str, setup: &Setup) -> Result<(), String> {
     }
     drop(raw);
 
-    let mut cmd = KeycardCommandSet::new_with_ca(TcpLink::connect(addr).map_err(io)?, SIMULATOR_CA);
+    let ca = SecretKey::from_slice(&setup.ca)
+        .map_err(io)?
+        .public_key(&Secp256k1::new())
+        .serialize();
+    let mut cmd = KeycardCommandSet::new_with_ca(TcpLink::connect(addr).map_err(io)?, ca);
     check("select", cmd.select())?;
     let v1 = cmd.secure_channel_version() == Some(SecureChannelVersion::V1);
     if !cmd.app_info().is_some_and(|i| i.is_initialized()) {
@@ -153,6 +172,7 @@ pub fn personalize(addr: &str, setup: &Setup) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::link::SIMULATOR_CA;
 
     #[test]
     fn the_test_ca_is_the_one_the_simulator_link_trusts() {

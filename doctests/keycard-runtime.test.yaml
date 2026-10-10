@@ -200,6 +200,42 @@ sections:
           - '\"removed\":true'
           - "keycard-73c5da0a-84-1-0"
 
+  - title: "A card Keycard didn't sign"
+    step: true
+    text: |
+      A 4.0 card whose identity no trusted CA signed, such as one a person loaded the applet onto, is
+      refused, and `cards` shows its identity key. The person may trust that one card in the Keycard
+      app, after a warning that a counterfeit could keep their PIN or their keys.
+    steps:
+      - title: "Swap in a card another CA signed"
+        run: |
+          ./simulator/bin/keycard-simulator-setup 127.0.0.1:47333 --fresh --untrusted
+          ./logos/bin/logoscore call keycard_module cards > untrusted.json
+          cat untrusted.json
+        code_block: "logoscore call keycard_module cards"
+        expect_contains:
+          - "not signed by Keycard"
+          - '\"untrusted\":\"'
+      - title: "Trust it"
+        run: |
+          python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])["cards"][0]["untrusted"])' untrusted.json > identity
+          ./logos/bin/logoscore call keycard_module trust_card "{\"identity\":\"$(cat identity)\"}"
+          ./logos/bin/logoscore call keycard_module cards
+        code_block: |
+          logoscore call keycard_module trust_card '{"identity":"<the identity cards shows>"}'
+          logoscore call keycard_module cards
+        expect_contains:
+          - '\"trustedByPerson\":true'
+          - '\"version\":\"4.0\"'
+      - title: "Forget it: it is refused again"
+        run: |
+          ./logos/bin/logoscore call keycard_module forget_card "str:$(cat identity)"
+          ./logos/bin/logoscore call keycard_module cards
+        code_block: "logoscore call keycard_module forget_card <the identity>"
+        expect_contains:
+          - '\"removed\":true'
+          - '\"untrusted\":\"'
+
   - title: "Stop"
     step: true
     steps:

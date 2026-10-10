@@ -76,6 +76,15 @@ pub struct PairRequest {
     pub pairing_password: Secret,
 }
 
+/// Trust a 4.0 card Keycard didn't sign, by the identity key `cards` shows for it.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TrustRequest {
+    #[serde(default)]
+    pub reader: Option<String>,
+    pub identity: String,
+}
+
 /// Change the PIN, with the current one.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -118,6 +127,10 @@ pub struct Present {
     pub paired: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// A 4.0 card refused because Keycard didn't sign its identity: that identity key, which the
+    /// person may choose to trust.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub untrusted: Option<String>,
 }
 
 struct Shared {
@@ -350,10 +363,13 @@ impl Shared {
             .readers
             .connect(&slot.reader, true)
             .map_err(CardError::Link)
-            .and_then(|ch| Card::select(ch, self.readers.trusted_cas()));
-        let (card, error) = match looked {
-            Ok(c) => (Some(c.info()), None),
-            Err(e) => (None, Some(e.to_string())),
+            .and_then(|ch| Card::select(ch, self.readers.trusted_cas(), self.trusted()));
+        let (card, error, untrusted) = match looked {
+            Ok(c) => (Some(c.info()), None, None),
+            Err(CardError::Untrusted(identity)) => {
+                (None, Some(CardError::Untrusted(None).to_string()), identity)
+            }
+            Err(e) => (None, Some(e.to_string()), None),
         };
         let paired = card
             .as_ref()
@@ -365,7 +381,13 @@ impl Shared {
             card,
             paired,
             error,
+            untrusted,
         }
+    }
+
+    /// The identity keys of the cards the person trusted though Keycard didn't sign them.
+    fn trusted(&self) -> Vec<[u8; 33]> {
+        lock(&self.store).trusted()
     }
 
     /// Look at the readers, reading a card again only once it was inserted again.
@@ -455,7 +477,7 @@ impl Shared {
             .readers
             .connect(reader, false)
             .map_err(CardError::Link)?;
-        let mut card = Card::select(channel, self.readers.trusted_cas())?;
+        let mut card = Card::select(channel, self.readers.trusted_cas(), self.trusted())?;
         let pairing = card
             .info()
             .instance_uid
@@ -728,7 +750,8 @@ impl KeycardSigner {
             .readers
             .connect(&reader, false)
             .map_err(|e| card_error(CardError::Link(e)))?;
-        let mut card = Card::select(channel, self.s.readers.trusted_cas()).map_err(card_error)?;
+        let mut card = Card::select(channel, self.s.readers.trusted_cas(), self.s.trusted())
+            .map_err(card_error)?;
         let uid = card
             .info()
             .instance_uid
@@ -744,6 +767,49 @@ impl KeycardSigner {
         self.s.reread(&reader);
         self.s.refresh_cards();
         Ok(())
+    }
+
+    /// Trust a 4.0 card Keycard didn't sign, as the person decides in the Keycard app: from now
+    /// on it is used like a genuine one. Only a card in a reader now, refused with this identity,
+    /// can be trusted; any other card Keycard didn't sign is still refused.
+    pub fn trust_card(&self, req: TrustRequest) -> Result<(), SignerError> {
+        self.s.refresh_if_idle();
+        let identity = req.identity.trim().to_ascii_lowercase();
+        let reader = lock(&self.s.cards)
+            .iter()
+            .find(|p| {
+                p.untrusted.as_deref() == Some(identity.as_str())
+                    && req.reader.as_deref().is_none_or(|r| r == p.reader)
+            })
+            .map(|p| p.reader.clone())
+            .ok_or_else(|| {
+                err(
+                    ErrorCode::Invalid,
+                    "no card refused with this identity is in a reader",
+                )
+            })?;
+        lock(&self.s.store)
+            .trust(&identity)
+            .map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
+        self.s.reread(&reader);
+        self.s.refresh_cards();
+        Ok(())
+    }
+
+    /// Stop trusting a card Keycard didn't sign: it is refused again. Whether it was trusted.
+    pub fn forget_card(&self, identity: &str) -> Result<bool, SignerError> {
+        let gone = lock(&self.s.store)
+            .untrust(identity)
+            .map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
+        let readers: Vec<String> = lock(&self.s.cards)
+            .iter()
+            .map(|p| p.reader.clone())
+            .collect();
+        for r in &readers {
+            self.s.reread(r);
+        }
+        self.s.refresh_cards();
+        Ok(gone)
     }
 
     /// Change the card's PIN, with the current one.

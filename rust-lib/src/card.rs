@@ -6,7 +6,7 @@ use std::str::FromStr;
 use bitcoin::secp256k1::{ecdsa, schnorr, PublicKey};
 use keycard_rs::constants::{export_key_p2, sign_p2};
 use keycard_rs::parsing::key_path::KeyPath;
-use keycard_rs::parsing::{ApplicationInfo, Bip32KeyPair};
+use keycard_rs::parsing::{ApplicationInfo, Bip32KeyPair, Certificate};
 use keycard_rs::{ApduResponse, KeycardCommandSet, Pairing, SecureChannelVersion};
 use serde::Serialize;
 
@@ -17,8 +17,8 @@ use crate::link::Channel;
 pub enum CardError {
     /// SELECT found no Keycard applet.
     NotKeycard,
-    /// A 4.0 card whose identity no trusted CA signed.
-    Untrusted,
+    /// A 4.0 card whose identity no trusted CA signed, nor the person trusted: its identity key.
+    Untrusted(Option<String>),
     NotInitialized,
     /// Initialised, but holding no key yet.
     NoKey,
@@ -42,7 +42,7 @@ impl std::fmt::Display for CardError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CardError::NotKeycard => f.write_str("this card is not a Keycard"),
-            CardError::Untrusted => {
+            CardError::Untrusted(_) => {
                 f.write_str("this card's identity is not signed by Keycard: it may not be genuine")
             }
             CardError::NotInitialized => {
@@ -74,7 +74,7 @@ fn link(e: keycard_rs::Error) -> CardError {
     match e {
         keycard_rs::Error::WrongPin(w) => CardError::WrongPin(w.retry_attempts),
         keycard_rs::Error::Apdu(a) => CardError::Refused(a.sw()),
-        keycard_rs::Error::Protocol(m) if m.contains("certificate") => CardError::Untrusted,
+        keycard_rs::Error::Protocol(m) if m.contains("certificate") => CardError::Untrusted(None),
         other => CardError::Link(other.to_string()),
     }
 }
@@ -106,10 +106,16 @@ pub struct CardInfo {
     pub pin_retries: Option<u8>,
     /// BIP340 signing, taproot's, needs applet 4.0.
     pub taproot: bool,
+    /// A 4.0 card's identity key, compressed, hex, from its certificate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    /// Keycard didn't sign this card's identity: it is used only because the person trusted it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub trusted_by_person: bool,
 }
 
 impl CardInfo {
-    fn of(info: &ApplicationInfo) -> CardInfo {
+    fn of(info: &ApplicationInfo, trusted_by_person: bool) -> CardInfo {
         let v2 = info.app_version() >= 0x0400;
         CardInfo {
             version: info.app_version_string(),
@@ -119,30 +125,56 @@ impl CardInfo {
             secure_channel: if v2 { 2 } else { 1 },
             pin_retries: info.pin_retries(),
             taproot: v2,
+            identity: certificate(info).map(|c| hex::encode(c.ident_pub())),
+            trusted_by_person,
         }
     }
+}
+
+fn certificate(info: &ApplicationInfo) -> Option<Certificate> {
+    Certificate::from_tlv(info.cert_data()?).ok()
 }
 
 /// A Keycard, selected.
 pub struct Card {
     cmd: KeycardCommandSet,
     info: ApplicationInfo,
+    trusted_by_person: bool,
 }
 
 impl Card {
-    /// Select the Keycard applet, checking a 4.0 card's identity against `cas`.
-    pub fn select(channel: Channel, cas: Vec<[u8; 33]>) -> Result<Card> {
-        let mut cmd = KeycardCommandSet::new_with_cas(channel, cas, Vec::new());
-        let r = cmd.select().map_err(link)?;
+    /// Select the Keycard applet. A 4.0 card's identity must be signed by one of `cas`, or be one
+    /// of the identity keys in `trusted`, the cards the person chose to trust.
+    pub fn select(channel: Channel, cas: Vec<[u8; 33]>, trusted: Vec<[u8; 33]>) -> Result<Card> {
+        let mut cmd = KeycardCommandSet::new_with_cas(channel, cas.clone(), trusted);
+        let r = match cmd.select() {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(match link(e) {
+                    CardError::Untrusted(_) => CardError::Untrusted(
+                        cmd.app_info()
+                            .and_then(certificate)
+                            .map(|c| hex::encode(c.ident_pub())),
+                    ),
+                    other => other,
+                })
+            }
+        };
         if r.sw() != 0x9000 {
             return Err(CardError::NotKeycard);
         }
         let info = cmd.app_info().cloned().ok_or(CardError::NotKeycard)?;
-        Ok(Card { cmd, info })
+        let trusted_by_person = certificate(&info)
+            .is_some_and(|c| !cas.iter().any(|ca| c.public_key() == ca.as_slice()));
+        Ok(Card {
+            cmd,
+            info,
+            trusted_by_person,
+        })
     }
 
     pub fn info(&self) -> CardInfo {
-        CardInfo::of(&self.info)
+        CardInfo::of(&self.info, self.trusted_by_person)
     }
 
     fn v1(&self) -> bool {

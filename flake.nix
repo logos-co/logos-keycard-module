@@ -103,7 +103,12 @@
             '';
           };
         in
-        pkgs.writeShellApplication {
+        pkgs.symlinkJoin {
+          name = "keycard-simulator";
+          # The wrapper, and the setup on its own, to swap in another card while it serves.
+          paths = [
+            (setup pkgs)
+            (pkgs.writeShellApplication {
           name = "keycard-simulator";
           runtimeInputs = [ jdk (setup pkgs) ];
           text = ''
@@ -128,6 +133,8 @@
             done
             keycard-simulator-setup "127.0.0.1:$port" --fresh
           '';
+            })
+          ];
         };
     in
     {
