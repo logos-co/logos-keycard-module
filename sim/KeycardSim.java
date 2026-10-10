@@ -14,11 +14,13 @@ import javacard.framework.Applet;
 /**
  * A Keycard in jCardSim, running the Keycard applets as built from their source, its APDUs served
  * over TCP: each one length-prefixed, its answer the data's length, the data and the status word.
- * The pseudo-APDU FF 7F 00 00 swaps in a factory-fresh card.
+ * The pseudo-APDU FF 7F 00 00 swaps in a factory-fresh card; FF 7F 01 00 answers how many times, in
+ * four bytes, as a reader's event count tells a card was inserted again.
  */
 public class KeycardSim {
   private static final byte[] PKG = {(byte) 0xA0, 0x00, 0x00, 0x08, 0x04, 0x00, 0x01};
   private static final byte[] FRESH = {(byte) 0xFF, 0x7F, 0x00, 0x00};
+  private static final byte[] INSERTIONS = {(byte) 0xFF, 0x7F, 0x01, 0x00};
   private static final byte[] OK = {(byte) 0x90, 0x00};
 
   private static byte[] aid(int applet, boolean instance) {
@@ -60,6 +62,7 @@ public class KeycardSim {
   public static void main(String[] args) throws Exception {
     int port = Integer.parseInt(args[0]);
     CardSimulator sim = card();
+    int insertions = 0;
     ServerSocket server = new ServerSocket(port, 8, InetAddress.getByName("127.0.0.1"));
     System.out.println("listening 127.0.0.1:" + server.getLocalPort());
     System.out.flush();
@@ -80,7 +83,11 @@ public class KeycardSim {
           byte[] r;
           if (Arrays.equals(apdu, FRESH)) {
             sim = card();
+            insertions++;
             r = OK;
+          } else if (Arrays.equals(apdu, INSERTIONS)) {
+            r = new byte[] {(byte) (insertions >> 24), (byte) (insertions >> 16), (byte) (insertions >> 8),
+                (byte) insertions, (byte) 0x90, 0x00};
           } else {
             r = sim.transmitCommand(apdu);
           }

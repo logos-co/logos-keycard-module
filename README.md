@@ -10,7 +10,10 @@ card, and the PIN only passes through; a 3.x card's pairing is the one secret th
 - The signer interface: `signer_info`, `signer_accounts`, `sign`, `sign_status`, `sign_result`,
   `cancel_sign`.
 - For the Keycard's app: `cards`, `add_accounts`, `add_status`, `remove_account`, `pair`,
-  `change_pin`, `unblock_pin`.
+  `change_pin`, `unblock_pin`, `trust_card`, `forget_card`.
+
+A 4.0 card whose identity Keycard didn't sign is refused, unless the person trusts that one card in
+the Keycard app, after a warning that a counterfeit could keep their PIN or their keys.
 
 See [`docs/specs.md`](docs/specs.md) for the reference.
 

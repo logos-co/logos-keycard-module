@@ -13,7 +13,7 @@ use zeroize::Zeroize;
 
 use crate::link;
 use crate::signer::{
-    AddRequest, ChangePinRequest, Events, KeycardSigner, PairRequest, UnblockRequest,
+    AddRequest, ChangePinRequest, Events, KeycardSigner, PairRequest, TrustRequest, UnblockRequest,
 };
 use crate::store::Store;
 
@@ -28,7 +28,7 @@ pub trait KeycardModule: Send + Sync + 'static {
 
     // ── the Keycard's app ────────────────────────────────────────────────
     /// The readers holding a card, and what each card tells before its PIN:
-    /// `{ ok, cards: [{ reader, version?, initialized?, keyUid?, secureChannel?, pinRetries?, taproot?, paired, error? }] }`.
+    /// `{ ok, cards: [{ reader, version?, initialized?, keyUid?, secureChannel?, pinRetries?, taproot?, identity?, trustedByPerson?, paired, error?, untrusted? }] }`.
     fn cards(&self) -> String;
     /// Export accounts once the card's PIN opens it:
     /// `{ families, chain?, account?, label?, reader?, pin }` → `{ ok, job }`.
@@ -43,6 +43,11 @@ pub trait KeycardModule: Send + Sync + 'static {
     fn change_pin(&self, params_json: String) -> String;
     /// Set a new PIN with the PUK: `{ reader?, puk, newPin }` → `{ ok }`.
     fn unblock_pin(&self, params_json: String) -> String;
+    /// Trust a 4.0 card Keycard didn't sign, by the identity `cards` shows as `untrusted`:
+    /// `{ reader?, identity }` → `{ ok }`.
+    fn trust_card(&self, params_json: String) -> String;
+    /// Stop trusting such a card: `{ ok, removed }`.
+    fn forget_card(&self, identity: String) -> String;
 
     fn on_context_ready(&self, _ctx: &RustModuleContext) {}
 }
@@ -192,6 +197,20 @@ impl KeycardModule for KeycardModuleImpl {
         match read::<UnblockRequest>(params_json) {
             Ok(req) => done(self.keycard.unblock_pin(req)),
             Err(e) => e,
+        }
+    }
+
+    fn trust_card(&self, params_json: String) -> String {
+        match read::<TrustRequest>(params_json) {
+            Ok(req) => done(self.keycard.trust_card(req)),
+            Err(e) => e,
+        }
+    }
+
+    fn forget_card(&self, identity: String) -> String {
+        match self.keycard.forget_card(&identity) {
+            Ok(removed) => json!({ "ok": true, "removed": removed }).to_string(),
+            Err(e) => signer_err(e),
         }
     }
 

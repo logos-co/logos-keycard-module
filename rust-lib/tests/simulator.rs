@@ -14,7 +14,7 @@ use bitcoin::secp256k1::Secp256k1;
 use keycard_module::accounts;
 use keycard_module::link::Simulator;
 use keycard_module::signer::{
-    AddRequest, ChangePinRequest, KeycardSigner, PairRequest, Quiet, UnblockRequest,
+    AddRequest, ChangePinRequest, KeycardSigner, PairRequest, Quiet, TrustRequest, UnblockRequest,
 };
 use keycard_module::sim::{self, Setup};
 use keycard_module::store::Store;
@@ -387,4 +387,65 @@ fn a_3x_card_is_paired_once_then_signs() {
         },
         &mut |_, _| std::thread::sleep(Duration::from_millis(100)),
     );
+}
+
+#[test]
+fn a_card_keycard_did_not_sign_is_used_only_once_the_person_trusts_it() {
+    let Some(addr) = simulator() else { return };
+    let _turn = turn();
+    let unsigned = |identity| Setup {
+        ca: sim::OTHER_CA_SECRET,
+        identity,
+        ..Setup::default()
+    };
+    let mut k = rig(&addr, &unsigned(sim::OTHER_IDENTITY_SECRET));
+    let card = k.cards().remove(0);
+    assert!(card.card.is_none(), "{card:?}");
+    assert!(
+        card.error
+            .as_deref()
+            .unwrap_or("")
+            .contains("not signed by Keycard"),
+        "{card:?}"
+    );
+    let identity = card.untrusted.clone().expect("its identity, to trust");
+    assert!(exported(&k, add_request(vec![Family::Evm], Chain::Test)).is_err());
+
+    let trust = |identity: &str| TrustRequest {
+        reader: None,
+        identity: identity.into(),
+    };
+    let e = k
+        .trust_card(trust(&format!("02{}", "11".repeat(32))))
+        .unwrap_err();
+    assert_eq!(
+        e.code,
+        ErrorCode::Invalid,
+        "only a card refused in a reader now"
+    );
+    k.trust_card(trust(&identity)).expect("trusted");
+    let info = k.cards()[0].card.clone().expect("used once trusted");
+    assert!(info.trusted_by_person);
+    assert_eq!(info.identity.as_deref(), Some(identity.as_str()));
+    let evm = add(&k, vec![Family::Evm], Chain::Test).remove(0);
+    let job = k.sign(request(&evm, Some(PIN))).expect("signs");
+    assert_eq!(settle(&mut k, &job), JobState::Done);
+
+    assert!(k.forget_card(&identity).unwrap());
+    let card = k.cards().remove(0);
+    assert_eq!(
+        card.untrusted.as_deref(),
+        Some(identity.as_str()),
+        "refused again"
+    );
+    assert!(!k.forget_card(&identity).unwrap());
+    k.trust_card(trust(&identity)).expect("trusted again");
+
+    // Another card Keycard didn't sign is still refused.
+    sim::fresh(&addr).unwrap();
+    sim::personalize(&addr, &unsigned([0x3c; 32])).unwrap();
+    k.refresh();
+    let other = k.cards().remove(0);
+    assert!(other.card.is_none(), "{other:?}");
+    assert!(other.untrusted.is_some() && other.untrusted != Some(identity));
 }

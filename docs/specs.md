@@ -26,6 +26,15 @@ secure channels:
 - **Applet 3.x** pairs first, with the card's pairing password, in one of its five pairing slots.
   The Keycard's app does this once (`pair`); the module keeps the pairing by the card's instance UID.
 
+**A card Keycard didn't sign.** A 4.0 card whose identity no trusted CA signed is refused: one a
+person loaded the applet onto, or a counterfeit. `cards` lists it with that error and its identity
+key as `untrusted`, and nothing else is done with it. The person may still trust that one card in
+the Keycard app (`trust_card`), after a warning that a counterfeit could keep their PIN or their
+keys. Its identity key is then kept in `trusted_cards.json`, and keycard-rs accepts it in place of a
+CA's signature. The secure channel still proves the card holds that identity, so any other card
+Keycard didn't sign is still refused. `cards` marks a trusted one `trustedByPerson`, and
+`forget_card` refuses it again.
+
 | Status word | Means | The module answers |
 |---|---|---|
 | `63Cx` | wrong PIN or PUK, `x` tries left | `wrong_secret`, with the tries left |
@@ -99,9 +108,10 @@ The signer interface's methods, as `docs/interface.md` there specifies them:
 For the Keycard's app:
 
 - `cards`: the readers holding a card, and what each card's SELECT told:
-  `{ ok, cards: [{ reader, version?, initialized?, keyUid?, instanceUid?, secureChannel?, pinRetries?, taproot?, paired, error? }] }`.
+  `{ ok, cards: [{ reader, version?, initialized?, keyUid?, instanceUid?, secureChannel?, pinRetries?, taproot?, identity?, trustedByPerson?, paired, error?, untrusted? }] }`.
   `secureChannel` is 1 for a 3.x card and 2 for a 4.0 one; only a 4.0 card tells `pinRetries`
-  before its PIN.
+  before its PIN. `identity` is a 4.0 card's identity key; `untrusted` is the identity key of a
+  card refused because Keycard didn't sign it.
 - `add_accounts`: `{ families, chain?, account?, label?, reader?, pin }` → `{ ok, job }`, once the PIN
   is verified. `chain` is `main` or `test`, `test` by default; `reader` is needed only when more
   than one holds a Keycard.
@@ -111,6 +121,9 @@ For the Keycard's app:
 - `pair`: `{ reader?, pairingPassword }` → `{ ok }`. A 3.x card only.
 - `change_pin`: `{ reader?, pin, newPin }` → `{ ok }`.
 - `unblock_pin`: `{ reader?, puk, newPin }` → `{ ok }`.
+- `trust_card`: `{ reader?, identity }` → `{ ok }`. Only a card refused with that identity, in a
+  reader now, can be trusted.
+- `forget_card`: the identity key → `{ ok, removed }`.
 
 Who may call which comes from module identity in the new core.
 
@@ -128,8 +141,8 @@ Java's smart-card simulator. `sim/KeycardSim.java` installs the applets and serv
 TCP; the pseudo-APDU `FF 7F 00 00` swaps in a factory-fresh card. `nix run .#simulator -- <port>
 [4.0|3.2]` runs one and sets it up with PIN 123456, PUK 987654321098 and the BIP39 test phrase's key,
 through `keycard-simulator-setup`. A 4.0 card first gets the identity a factory gives it, signed by
-the applet tests' CA, which only the simulator's link trusts. `KEYCARD_SIMULATOR=127.0.0.1:<port>`
-points the module at it instead of PC/SC.
+the applet tests' CA, which only the simulator's link trusts; `--untrusted` has another CA sign it.
+`KEYCARD_SIMULATOR=127.0.0.1:<port>` points the module at it instead of PC/SC.
 
 Two changes make the applet run in jCardSim 3.0.5, both for the simulator only: 4.0's scratch EC
 keys live in ordinary memory, since jCardSim has no transient ones, and jCardSim's RSA without
@@ -143,7 +156,9 @@ The tests check, with `KEYCARD_SIMULATOR` naming a 4.0 card and `KEYCARD_SIMULAT
 - a wrong PIN counts down, a blocked one is unblocked with the PUK, and the PIN changes;
 - the alternate PIN, and a card with another key, sign nothing for the account;
 - a Bitcoin item outside its account is refused;
-- a 3.x card signs only once paired, and refuses taproot.
+- a 3.x card signs only once paired, and refuses taproot;
+- a card Keycard didn't sign is used only once the person trusts it, and is refused again once
+  forgotten, while another such card stays refused.
 
 ## By hand, with a Keycard
 
