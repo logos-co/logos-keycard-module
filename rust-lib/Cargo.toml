@@ -1,0 +1,48 @@
+[package]
+name = "keycard_module"
+version = "0.1.0"
+edition = "2021"
+description = "Logos signer module for a bare Keycard over PC/SC: its accounts, and hashes signed once its PIN opens it."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/logos-co/logos-keycard-module"
+# The module builder's rustc; resolver 3 keeps the lock within it.
+rust-version = "1.89"
+
+[workspace]
+resolver = "3"
+
+[lib]
+# staticlib for the Qt plugin; rlib so cargo test builds the core without the Logos runtime.
+crate-type = ["staticlib", "rlib"]
+
+[[bin]]
+name = "keycard-simulator-setup"
+path = "src/bin/simulator_setup.rs"
+required-features = ["simulator"]
+
+[dependencies]
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "313ad6abf3b028fc44cfad41dc227a8b9aa3ec85" }
+# The Keycard's commands and both secure channels; PC/SC is this crate's own, below.
+keycard-rs = { git = "https://github.com/keycard-tech/keycard-rs", rev = "142ab915eda6bc4c1dc10078028f0d7b0748b218", default-features = false }
+# BIP32 keys, ECDSA with recovery, BIP340 and the taproot tweak. The plugin's export list keeps libsecp256k1 in.
+bitcoin = { version = "0.32.102", default-features = false, features = ["std", "secp-recovery"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+sha3 = "0.10"
+zeroize = "1"
+# Smart-card readers: pcsc-lite on Linux, PCSC.framework on macOS, winscard.dll on Windows.
+pcsc = { version = "2", optional = true }
+
+# Staged by the builder as a sibling crate; optional so cargo test builds the core without it.
+logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
+
+[dev-dependencies]
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "313ad6abf3b028fc44cfad41dc227a8b9aa3ec85", features = ["mock", "conformance"] }
+
+[features]
+default = ["logos_module", "pcsc"]
+logos_module = ["dep:logos-rust-sdk"]
+pcsc = ["dep:pcsc"]
+# Personalises a simulated card for the tests: its identity, PIN and keys.
+simulator = []

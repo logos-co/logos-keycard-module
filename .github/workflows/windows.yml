@@ -1,0 +1,23 @@
+name: Windows
+
+# The entire per-repo cost of Windows CI. The Nix install and cache, the
+# target-existence guard, the cold-cache refusal, the PE-format and
+# import-closure gates, and the artifact hand-off all live once in
+# logos-co/logos-windows-ci.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  windows:
+    uses: logos-co/logos-windows-ci/.github/workflows/windows-ci.yml@v1
+    secrets: inherit
+    with:
+      targets: default
+      # Unmeasured for this repo: the manager's 430 for the same bitcoin and interface crates, plus
+      # keycard-rs and its RustCrypto stack. Measure on the first run and tighten.
+      cold-derivation-budget: 480
+      # No smoke: a module plugin has no entry point to run here; a consumer's job loads it.

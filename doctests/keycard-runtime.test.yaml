@@ -1,0 +1,216 @@
+name: "Signing with a Keycard"
+output: keycard-runtime.md
+release: ""
+
+intro: |
+  `keycard_module` is a bare Keycard behind the signer interface, in a smart-card reader. The person
+  offers accounts from the card, the signer manager lists them, and each request is signed once the
+  card's PIN opens it. A Keycard has no screen: it signs the hash the manager computes, so the person
+  relies on what the signer app shows. The module keeps public material only; a 3.x card's pairing
+  is the one secret it keeps.
+
+  This doc-test runs headless through `logoscore`, against `keycard-simulator`: the Keycard applet
+  4.0, built from its source, in jCardSim, set up with PIN 123456 and the "abandon … about" test
+  phrase's key.
+
+what_you_build: "The Keycard module, the signer manager and a simulated Keycard, driven through a `logoscore` daemon."
+
+what_you_learn:
+  - How accounts are offered from a Keycard, once its PIN opens it
+  - How the signer manager has a Keycard sign the hash it computed, and checks the signature
+  - How a wrong PIN leaves the request on screen, for the person to try again
+
+prerequisites:
+  - "**Nix** with flakes enabled."
+  - "**A Linux or macOS machine.** Everything here is offline, and no card or reader is needed."
+
+sections:
+  - title: "Build logoscore and lgpm"
+    step: true
+    steps:
+      - title: "Build logoscore"
+        run: "nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos"
+        check_file: "logos/bin/logoscore"
+      - title: "Build lgpm"
+        run: "nix build 'github:logos-co/logos-package-manager#cli' -o lgpm"
+        check_file: "lgpm/bin/lgpm"
+
+  - title: "Build and install the modules"
+    step: true
+    text: |
+      The manager's doc-test probe plays the requester and the approver, as the wallet and the
+      signer app do.
+    steps:
+      - title: "Build the Keycard module, the simulator, the manager and its probe"
+        run: |
+          nix build 'github:logos-co/logos-keycard-module{release}#lgx' --no-write-lock-file -o keycard-lgx
+          nix build 'github:logos-co/logos-keycard-module{release}#simulator' --no-write-lock-file -o simulator
+          nix build 'github:logos-co/logos-evm-keystore-module/e4c6fcd39411f0ed52083f0a7fb2701e742f81f1#lgx' --no-write-lock-file -o keystore-lgx
+          nix build 'github:logos-co/logos-signer-manager-module/69ea9439bd29d62ce69bfa836f4acf854facba14#lgx' --no-write-lock-file -o manager-lgx
+          nix build 'github:logos-co/logos-signer-manager-module/69ea9439bd29d62ce69bfa836f4acf854facba14?dir=doctests/manager-probe#lgx' --override-input signer_manager_module 'github:logos-co/logos-signer-manager-module/69ea9439bd29d62ce69bfa836f4acf854facba14' --override-input keystore_module 'github:logos-co/logos-evm-keystore-module/e4c6fcd39411f0ed52083f0a7fb2701e742f81f1' --no-write-lock-file -o probe-lgx
+          ls keycard-lgx/*.lgx simulator/bin/
+        code_block: |
+          nix build '.#lgx' -o keycard-lgx
+          nix build '.#simulator' -o simulator      # a Keycard in software, for tests
+        expect_contains:
+          - "keycard-simulator"
+      - title: "Install them"
+        run: |
+          mkdir -p modules
+          cp -RL ./logos/modules/. ./modules/
+          chmod -R u+w modules
+          for p in keycard keystore manager probe; do ./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file $p-lgx/*.lgx; done
+          ./lgpm/bin/lgpm --modules-dir ./modules list
+        code_block: "lgpm --modules-dir ./modules --allow-unsigned install --file keycard-lgx/*.lgx"
+        expect_contains:
+          - "keycard_module"
+          - "signer_manager_module"
+          - "manager_probe"
+
+  - title: "A simulated Keycard, and the daemon"
+    step: true
+    steps:
+      - title: "Start the simulated Keycard"
+        text: "It prints `ready` once the card is set up."
+        run: "sh -c './simulator/bin/keycard-simulator 47333 > card.log 2>&1 & echo $! > card.pid'; for i in $(seq 1 60); do grep -q ready card.log && break; sleep 1; done; cat card.log"
+        code_block: "keycard-simulator 47333 &        # a 4.0 card on 127.0.0.1:47333"
+        expect_contains:
+          - "ready 127.0.0.1:47333"
+      - title: "Start the daemon, pointed at it"
+        text: "Without `KEYCARD_SIMULATOR`, the module looks for cards in the smart-card readers PC/SC knows."
+        run: "sh -c 'KEYCARD_SIMULATOR=127.0.0.1:47333 ./logos/bin/logoscore -D -m ./modules > logs.txt 2>&1 &'"
+        code_block: "KEYCARD_SIMULATOR=127.0.0.1:47333 logoscore -D -m ./modules > logs.txt &"
+      - run: "sleep 3"
+      - title: "Load the Keycard module, and the probe with the manager"
+        run: |
+          ./logos/bin/logoscore load-module keycard_module
+          ./logos/bin/logoscore load-module manager_probe
+        code_block: |
+          logoscore load-module keycard_module
+          logoscore load-module manager_probe
+        expect_contains:
+          - "keycard_module"
+          - "signer_manager_module"
+      - title: "It signs hashes, once its PIN is entered"
+        run: "./logos/bin/logoscore call keycard_module signer_info"
+        code_block: "logoscore call keycard_module signer_info"
+        expect_contains:
+          - '\"kind\":\"keycard\"'
+          - '\"showsRequest\":false'
+          - '\"collects\":\"pin\"'
+          - '\"requestKinds\":[\"hash\"]'
+      - title: "The card is in its reader"
+        text: "SELECT tells this much before any PIN: a 4.0 card proves its identity, a 3.x one needs pairing."
+        run: "./logos/bin/logoscore call keycard_module cards"
+        code_block: "logoscore call keycard_module cards"
+        expect_contains:
+          - '\"reader\":\"Keycard simulator\"'
+          - '\"version\":\"4.0\"'
+          - '\"secureChannel\":2'
+          - '\"taproot\":true'
+
+  - title: "Offer its accounts"
+    step: true
+    text: |
+      The Keycard's app asks for the accounts the person chooses, with the card's PIN. The module
+      exports their public keys, and a Bitcoin account's parent and master keys, for the fingerprints
+      its xpub carries. It keeps their public material and the card's key UID, nothing else.
+    steps:
+      - title: "An EVM, a native segwit and a taproot account"
+        run: |
+          ./logos/bin/logoscore call keycard_module add_accounts '{"families":["evm","bitcoin","bitcoin_taproot"],"chain":"test","pin":"123456"}' > add.json
+          job=$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' add.json job)
+          for i in $(seq 1 40); do ./logos/bin/logoscore call keycard_module add_status "$job" > added.json; grep -Eq 'state.....(done|failed)' added.json && break; sleep 0.5; done
+          cat added.json
+        code_block: |
+          logoscore call keycard_module add_accounts '{"families":["evm","bitcoin","bitcoin_taproot"],"chain":"test","pin":"123456"}'
+          logoscore call keycard_module add_status <job>
+        expect_contains:
+          - '\"state\":\"done\"'
+          - "0x9858effd232b4033e47d90003d41ec34ecaeda94"
+          - "keycard-73c5da0a-84-1-0"
+          - "keycard-73c5da0a-86-1-0"
+      - title: "The manager lists them under the Keycard"
+        run: |
+          ./logos/bin/logoscore call signer_manager_module configure '{"approvers":"manager_probe","custodians":"manager_probe","signers":["keycard_module"]}'
+          ./logos/bin/logoscore call signer_manager_module accounts
+        code_block: |
+          logoscore call signer_manager_module configure '{…, "signers":["keycard_module"]}'
+          logoscore call signer_manager_module accounts
+        expect_contains:
+          - '\"signer\":\"keycard_module\"'
+          - "0x9858effd232b4033e47d90003d41ec34ecaeda94"
+
+  - title: "Requests signed with the card's PIN"
+    step: true
+    text: |
+      The manager computes each hash and shows its own lines; `acknowledge` says the signer collects a
+      PIN. The approver passes the PIN through the manager to the module, and on to the card over its
+      encrypted channel; none of them keeps it. A wrong PIN leaves the request on screen. `str:`
+      keeps `logoscore` from reading a PIN as a number.
+    steps:
+      - title: "A message, after a wrong PIN"
+        run: |
+          ./logos/bin/logoscore call manager_probe request '{"address":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","purpose":"doc-test with a Keycard","legs":[{"kind":"message","text":"signed by a Keycard"}]}' > mreq.json
+          python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' mreq.json handle > mhandle; python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' mreq.json receipt > mreceipt
+          ./logos/bin/logoscore call manager_probe acknowledge "$(cat mhandle)" > mshown.json
+          cat mshown.json
+          bundle=$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' mshown.json bundle_id)
+          ./logos/bin/logoscore call manager_probe approve "$(cat mhandle)" "$bundle" str:000000
+          ./logos/bin/logoscore call manager_probe approve "$(cat mhandle)" "$bundle" str:123456
+          for i in $(seq 1 40); do ./logos/bin/logoscore call manager_probe status "$(cat mhandle)" "$(cat mreceipt)" > mstatus.json; grep -q 'settled' mstatus.json && break; sleep 0.5; done
+          cat mstatus.json
+          ./logos/bin/logoscore call manager_probe fetch "$(cat mhandle)" "$(cat mreceipt)"
+        code_block: |
+          logoscore call manager_probe request '{"address":"0x9858…aEda94","legs":[{"kind":"message","text":"signed by a Keycard"}]}'
+          logoscore call manager_probe approve <handle> <bundle_id> str:000000   # wrong_secret: 2 tries left
+          logoscore call manager_probe approve <handle> <bundle_id> str:123456
+          logoscore call manager_probe fetch <handle> <receipt>
+        expect_contains:
+          - '\"collects\":\"pin\"'
+          - '\"signer\":\"keycard_module\"'
+          - "wrong_secret"
+          - "2 tries left"
+          - '\"reason\":\"approved\"'
+          - '\"signed\":[\"0x'
+      - title: "A Sepolia transaction"
+        run: |
+          ./logos/bin/logoscore call manager_probe request '{"address":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","purpose":"doc-test with a Keycard","legs":[{"kind":"tx","chain_id":11155111,"tx":{"to":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","value":"0x1","nonce":"0x0","gas_limit":"0x5208","fee_mode":"eip1559","max_fee_per_gas":"0x3b9aca00","max_priority_fee_per_gas":"0x1"}}]}' > treq.json
+          python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' treq.json handle > thandle; python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' treq.json receipt > treceipt
+          ./logos/bin/logoscore call manager_probe acknowledge "$(cat thandle)" > tshown.json
+          ./logos/bin/logoscore call manager_probe approve "$(cat thandle)" "$(python3 -c 'import json,sys; print(json.loads(json.load(open(sys.argv[1]))["result"])[sys.argv[2]])' tshown.json bundle_id)" str:123456
+          for i in $(seq 1 40); do ./logos/bin/logoscore call manager_probe status "$(cat thandle)" "$(cat treceipt)" > tstatus.json; grep -q 'settled' tstatus.json && break; sleep 0.5; done
+          cat tstatus.json
+          ./logos/bin/logoscore call manager_probe fetch "$(cat thandle)" "$(cat treceipt)"
+        code_block: "logoscore call manager_probe request '{…, \"legs\":[{\"kind\":\"tx\",\"chain_id\":11155111, …}]}'"
+        expect_contains:
+          - '\"reason\":\"approved\"'
+          - '\"signed\":[\"0x02'
+
+  - title: "Take an account away"
+    step: true
+    steps:
+      - title: "The taproot account is no longer offered"
+        text: "Nothing on the card changes; it can be offered again."
+        run: |
+          ./logos/bin/logoscore call keycard_module remove_account keycard-73c5da0a-86-1-0
+          ./logos/bin/logoscore call keycard_module signer_accounts
+        code_block: "logoscore call keycard_module remove_account keycard-73c5da0a-86-1-0"
+        expect_contains:
+          - '\"removed\":true'
+          - "keycard-73c5da0a-84-1-0"
+
+  - title: "Stop"
+    step: true
+    steps:
+      - title: "Stop the daemon"
+        run: "./logos/bin/logoscore stop"
+        code_block: "logoscore stop"
+      - title: "Stop the simulated Keycard"
+        run: "kill $(cat card.pid)"
+      - run: "sleep 2"
+      - title: "Confirm the daemon has stopped"
+        run: "./logos/bin/logoscore status || true"
+        code_block: "logoscore status"
+        expect_contains:
+          - '"status":"not_running"'
