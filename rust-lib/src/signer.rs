@@ -401,6 +401,14 @@ impl Shared {
         }
     }
 
+    /// A session may change what the card's SELECT says, its pairing or its PIN tries, while the
+    /// reader's epoch stays: read it again at the next look.
+    fn reread(&self, reader: &str) {
+        for p in lock(&self.cards).iter_mut().filter(|p| p.reader == reader) {
+            p.epoch = None;
+        }
+    }
+
     /// The reader holding a card with this key.
     fn reader_holding(&self, key_uid: &str) -> Result<String, SignerError> {
         lock(&self.cards)
@@ -484,10 +492,12 @@ impl Shared {
                     let _ = checked_tx.send(Ok(()));
                     let r = then(&mut card);
                     drop(card);
+                    s.reread(&reader);
                     drop(hold);
                     after(&s, r);
                 }
                 Err(e) => {
+                    s.reread(&reader);
                     drop(hold);
                     let _ = checked_tx.send(Err(card_error(e)));
                 }
@@ -731,6 +741,7 @@ impl KeycardSigner {
             .map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
         drop(card);
         drop(_hold);
+        self.s.reread(&reader);
         self.s.refresh_cards();
         Ok(())
     }
@@ -742,9 +753,12 @@ impl KeycardSigner {
         self.s.refresh_if_idle();
         let reader = self.s.reader_named(req.reader.as_deref())?;
         let _hold = self.s.hold()?;
-        let mut card = self.s.open(&reader).map_err(card_error)?;
-        card.verify_pin(req.pin.expose()).map_err(card_error)?;
-        card.change_pin(req.new_pin.expose()).map_err(card_error)
+        let done = self.s.open(&reader).and_then(|mut card| {
+            card.verify_pin(req.pin.expose())?;
+            card.change_pin(req.new_pin.expose())
+        });
+        self.s.reread(&reader);
+        done.map_err(card_error)
     }
 
     /// Set a new PIN with the PUK.
@@ -754,9 +768,12 @@ impl KeycardSigner {
         self.s.refresh_if_idle();
         let reader = self.s.reader_named(req.reader.as_deref())?;
         let _hold = self.s.hold()?;
-        let mut card = self.s.open(&reader).map_err(card_error)?;
-        card.unblock_pin(req.puk.expose(), req.new_pin.expose())
-            .map_err(card_error)
+        let done = self
+            .s
+            .open(&reader)
+            .and_then(|mut card| card.unblock_pin(req.puk.expose(), req.new_pin.expose()));
+        self.s.reread(&reader);
+        done.map_err(card_error)
     }
 }
 

@@ -107,18 +107,32 @@ pub struct Simulator {
     addr: String,
 }
 
+/// How often this process swapped each simulator's card for a fresh one.
+static INSERTIONS: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn insertions() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<String, u64>> {
+    INSERTIONS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 impl Simulator {
     pub fn new(addr: impl Into<String>) -> Self {
         Simulator { addr: addr.into() }
+    }
+
+    /// The card at `addr` was swapped for a fresh one, as a card is inserted again.
+    pub fn inserted_again(addr: &str) {
+        *insertions().entry(addr.to_string()).or_default() += 1;
     }
 }
 
 impl Readers for Simulator {
     fn present(&self) -> Vec<Slot> {
         match TcpLink::connect(&self.addr) {
+            // As a reader's event count, the epoch moves only when the card is swapped.
             Ok(_) => vec![Slot {
                 reader: SIMULATOR_READER.into(),
-                epoch: None,
+                epoch: Some(insertions().get(&self.addr).copied().unwrap_or(0)),
             }],
             Err(_) => Vec::new(),
         }

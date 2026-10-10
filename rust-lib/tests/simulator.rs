@@ -199,6 +199,12 @@ fn a_blocked_pin_is_unblocked_with_the_puk() {
             "{}",
             e.message
         );
+        let tries = k.cards()[0].card.as_ref().and_then(|c| c.pin_retries);
+        assert_eq!(
+            tries,
+            Some(left),
+            "the card is read again after each session"
+        );
     }
     let e = k.sign(request(&evm, Some("000000"))).unwrap_err();
     assert_eq!(e.code, ErrorCode::Unavailable, "{}", e.message);

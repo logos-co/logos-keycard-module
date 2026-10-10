@@ -47,7 +47,8 @@ card exports even public keys only once its PIN is verified:
 They are kept in `accounts.json` in the module's own directory, each with the card's key UID, the
 SHA-256 of its master public key, which SELECT tells before any PIN. An account is `available` while
 a card with that key UID is in a reader. The module looks at the readers every second and a half,
-reads a card when it is inserted, and announces a change with `signer_changed` and
+reads a card when it is inserted and again after each of its own sessions, which can change the
+card's pairing or its PIN tries, and announces a change with `signer_changed` and
 `signer_accounts_changed`. `remove_account` stops offering an account.
 
 **The alternate PIN.** Applet 4.0 has a second PIN that opens a decoy wallet: the same master key with

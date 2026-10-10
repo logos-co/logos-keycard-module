@@ -6,7 +6,7 @@ use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
 use keycard_rs::parsing::Mnemonic;
 use keycard_rs::{ApduResponse, KeycardCommandSet, SecureChannelVersion};
 
-use crate::link::{TcpLink, SIMULATOR_CA};
+use crate::link::{Simulator, TcpLink, SIMULATOR_CA};
 
 /// The applet tests' CA key, which signs simulated cards' identities only.
 const TEST_CA_SECRET: [u8; 32] = [
@@ -66,6 +66,7 @@ pub fn fresh(addr: &str) -> Result<(), String> {
         .exchange(&[0xff, 0x7f, 0, 0])
         .map_err(io)?;
     if r == [0x90, 0x00] {
+        Simulator::inserted_again(addr);
         Ok(())
     } else {
         Err(format!("the simulator answered {}", hex::encode(r)))
