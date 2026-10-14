@@ -1,5 +1,5 @@
 //! One session with a Keycard, through keycard-rs: SELECT, the secure channel, the PIN, and the
-//! commands this module sends, EXPORT KEY for public keys and SIGN.
+//! public-key exports, administration commands and signing.
 
 use std::str::FromStr;
 
@@ -46,10 +46,10 @@ impl std::fmt::Display for CardError {
                 f.write_str("this card's identity is not signed by Keycard: it may not be genuine")
             }
             CardError::NotInitialized => {
-                f.write_str("this Keycard is not set up yet: set its PIN with Keycard's own app")
+                f.write_str("this Keycard is not set up yet: open Card administration to set its PIN")
             }
             CardError::NoKey => f.write_str(
-                "this Keycard holds no key yet: create or import one with Keycard's own app",
+                "this Keycard holds no key yet: create or import one in Card administration",
             ),
             CardError::NotPaired => f.write_str("pair this Keycard in the Keycard app first"),
             CardError::WrongPin(n) => write!(f, "wrong PIN: {n} tries left"),
@@ -60,7 +60,7 @@ impl std::fmt::Display for CardError {
             CardError::PukBlocked => f.write_str("the PUK is blocked: this card can only be reset"),
             CardError::WrongPairing => f.write_str("wrong pairing password"),
             CardError::NoPairingSlot => f.write_str(
-                "this Keycard has no free pairing slot: free one with Keycard's own app",
+                "this Keycard has no free pairing slot: free one in Card administration",
             ),
             CardError::Refused(sw) => write!(f, "the Keycard answered {sw:04x}"),
             CardError::Link(why) => write!(f, "Keycard link: {why}"),
@@ -92,6 +92,10 @@ fn ok(r: &ApduResponse) -> Result<()> {
 pub struct CardInfo {
     /// The applet's version, such as `3.1` or `4.0`.
     pub version: String,
+    /// Physical-card guard, also available before a 3.x card is initialized.
+    pub admin_id: String,
+    pub capabilities: u8,
+    pub free_pairing_slots: u8,
     pub initialized: bool,
     /// The SHA-256 of the card's master public key, hex; absent while it holds no key.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -115,10 +119,29 @@ pub struct CardInfo {
 }
 
 impl CardInfo {
+    /// Identifies the card/applet, independently of the wallet seed it currently holds.
+    pub fn id(&self) -> Option<String> {
+        if self.secure_channel == 2 {
+            self.identity.as_ref().map(|id| format!("identity:{id}"))
+        } else {
+            self.instance_uid
+                .as_ref()
+                .map(|id| format!("instance:{id}"))
+        }
+    }
+
     fn of(info: &ApplicationInfo, trusted_by_person: bool) -> CardInfo {
         let v2 = info.app_version() >= 0x0400;
         CardInfo {
             version: info.app_version_string(),
+            admin_id: certificate(info).map(|c| format!("identity:{}", hex::encode(c.ident_pub())))
+                .or_else(|| info.instance_uid().map(|v| format!("instance:{}", hex::encode(v))))
+                .unwrap_or_else(|| {
+                    use bitcoin::hashes::{sha256, Hash};
+                    format!("setup:{}", sha256::Hash::hash(info.secure_channel_pub_key().unwrap_or_default()))
+                }),
+            capabilities: info.capabilities(),
+            free_pairing_slots: info.free_pairing_slots(),
             initialized: info.is_initialized(),
             key_uid: info.has_master_key().then(|| hex::encode(info.key_uid())),
             instance_uid: info.instance_uid().map(hex::encode),
@@ -137,7 +160,7 @@ fn certificate(info: &ApplicationInfo) -> Option<Certificate> {
 
 /// A Keycard, selected.
 pub struct Card {
-    cmd: KeycardCommandSet,
+    pub(crate) cmd: KeycardCommandSet,
     info: ApplicationInfo,
     trusted_by_person: bool,
 }

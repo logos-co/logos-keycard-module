@@ -6,7 +6,7 @@ opened it. So the signer manager computes every hash itself, and the person reli
 lines in the signer app. This module lists the accounts the person offered from the card, and has
 the card sign each hash the manager hands it.
 
-**It holds no secret but one.** The keys stay on the card. The PIN reaches the card from the signer
+**During signing, the keys stay on the card.** The PIN reaches the card from the signer
 app through the manager and this module, over the card's encrypted channel, and none of them keeps
 it. What the module keeps is each offered account's public material and the card's key UID, and,
 for a 3.x card only, the pairing key its secure channel needs, readable by this user alone.
@@ -24,7 +24,10 @@ secure channels:
 - **Applet 4.0** (from 2026-09) proves its identity with a key its CA signed at the factory, which
   the module checks against Keycard's CA. It needs no pairing.
 - **Applet 3.x** pairs first, with the card's pairing password, in one of its five pairing slots.
-  The Keycard's app does this once (`pair`); the module keeps the pairing by the card's instance UID.
+  After persistence loads, the module tries `KeycardDefaultPairing` once per unpaired card per
+  app session. Failed attempts fall back to manual `pair`; saved pairings are reused.
+  Explicit unpair suppresses automatic pairing until restart. The module keeps the pairing
+  by the card's instance UID.
 
 **A card Keycard didn't sign.** A 4.0 card whose identity no trusted CA signed is refused: one a
 person loaded the applet onto, or a counterfeit. `cards` lists it with that error and its identity
@@ -47,7 +50,7 @@ Keycard didn't sign is still refused. `cards` marks a trusted one `trustedByPers
 The Keycard's app asks for the accounts the person chooses (`add_accounts`), with the PIN, since a
 card exports even public keys only once its PIN is verified:
 
-- **EVM**: `m/44'/60'/0'/0/0`. The id is the address, in lowercase.
+- **EVM**: `m/44'/60'/0'/0/i`, where `i` is the requested account index. The id is the address, in lowercase.
 - **Native segwit** and **taproot**: `m/84'` or `m/86'`, then `0'` for Bitcoin or `1'` for the test
   networks, then the account. The module builds the xpub from the account's public key and chain
   code, its parent's key for the parent fingerprint, and the master key for the master fingerprint.
@@ -112,9 +115,9 @@ For the Keycard's app:
   `secureChannel` is 1 for a 3.x card and 2 for a 4.0 one; only a 4.0 card tells `pinRetries`
   before its PIN. `identity` is a 4.0 card's identity key; `untrusted` is the identity key of a
   card refused because Keycard didn't sign it.
-- `add_accounts`: `{ families, chain?, account?, label?, reader?, pin }` → `{ ok, job }`, once the PIN
+- `add_accounts`: `{ families, chain?, account?, label?, reader?, cardId?, pin }` → `{ ok, job }`, once the PIN
   is verified. `chain` is `main` or `test`, `test` by default; `reader` is needed only when more
-  than one holds a Keycard.
+  than one holds a Keycard. `cardId` optionally pins the physical identity and is checked before PIN verification.
 - `add_status`: an export's progress, `{ ok, job, state, accounts?, error? }`, the state `working`,
   `done` or `failed`.
 - `remove_account`: stop offering an account, `{ ok, removed }`.
@@ -185,3 +188,49 @@ cd rust-lib && KEYCARD_SIMULATOR=127.0.0.1:47331 KEYCARD_SIMULATOR_V3=127.0.0.1:
   cargo test --no-default-features --features simulator
 nix build                                            # the module
 ```
+
+## Named seed wallets and physical cards
+
+`card_groups()` returns `{ ok, groups: [{ id, name, version, connected, legacy, accounts,
+connections, aliases }] }`. Wallet IDs are `seed:<keyUid>`. Keycard's key UID is SHA-256
+of the full uncompressed master public key, also used by the Shell module after confirmed
+root export. Multiple cards with the same seed form one wallet with multiple connections.
+Old account files already carry key UIDs and migrate without another PIN/export.
+
+Physical IDs remain `instance:<instanceUid>` on 3.x and `identity:<compressed identity key>`
+on 4.0. They are used for pairing, trust and PIN checks. `cards.json` retains these IDs,
+old names and observed key UIDs. Uninitialized cards with no seed still use a physical-ID
+group until a seed exists. A card with changed keys does not mark its old wallet available.
+
+`rename_card(id, name)` accepts either a seed wallet ID or physical card ID. Wallet names
+are stored in `wallet_names.json`; the first existing nonempty card name is the migration
+fallback, and all original card names are retained in `aliases`. Names are trimmed,
+limited to 80 characters, and cannot contain control characters. Re-exporting an account
+keeps its saved label; conflicting full public keys cannot overwrite an existing account ID.
+
+`forget_saved_card(seedId)` removes a disconnected seed wallet's offers, name and seed
+associations while retaining physical pairing/trust metadata. For compatibility, passing
+a physical card ID retains the previous card-specific forget behavior (name, pairing,
+trust and exclusive offers). `forget_card(identity)` only revokes trust. None of these
+operations erase card keys or pairing slots. Partial disk cleanup failures are surfaced.
+
+The simulator tests verify the applet key UID against a known master public key and cover
+shared seeds, availability, naming, forgetting and signing without touching real devices.
+
+
+## Physical-card administration
+
+The `administer` endpoint adds setup, recovery-key management, credential changes,
+pairing revocation, authenticity checks, public card data and reset. Its complete
+[action schema and scope](../README.md#physical-card-administration) are separate
+from signing. It checks the exact physical card and current key UID before any
+credential attempt or mutation. The trusted host or authenticated Keycard UI is
+required; arbitrary signing clients cannot invoke PIN-free factory reset.
+
+BIP39 generation/import briefly handles recovery material in host memory, without
+persisting it. Recovery verification compares the full master public key and a known derived
+public key (which also checks the chain code): an alternate-PIN wallet can share the public key while deriving different
+accounts. Erase/reset retain saved account and wallet metadata for other cards holding
+the same seed. They only remove a local pairing when that pairing is revoked/reset.
+
+`account_previews(accounts_json)` accepts an array of public signer accounts and returns `{ok, previews}` in the same order. Each preview contains `address`, full `path`, and `firstReceiving`, or an `error`. EVM uses its saved address; Bitcoin derives branch/index `0/0` with BIP84/BIP86 from the account xpub. Test accounts use testnet/signet encoding. No transport, PIN, state mutation, or private material is involved.

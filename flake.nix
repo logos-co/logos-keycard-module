@@ -38,6 +38,20 @@
           doCheck = false;
         };
 
+      unitTests = pkgs: pkgs.rustPlatform.buildRustPackage {
+        pname = "keycard-unit-tests";
+        version = "0.1.0";
+        src = pkgs.runCommand "keycard-test-src" { } ''
+          mkdir -p $out
+          cp -r ${./rust-lib} $out/rust-lib
+          cp -r ${logos-module-builder.packages.${pkgs.stdenv.hostPlatform.system}.rust-sdk-src} $out/logos-rust-sdk-src
+        '';
+        sourceRoot = "keycard-test-src/rust-lib";
+        cargoLock = { lockFile = ./rust-lib/Cargo.lock; allowBuiltinFetchGit = true; };
+        buildNoDefaultFeatures = true;
+        doCheck = true;
+      };
+
       # A Keycard in software for the tests: the Keycard applet built from its source, 4.0 and
       # the last 3.x, in jCardSim, served over TCP by sim/KeycardSim.java. Two changes make the
       # applet run there: 4.0's scratch EC keys live in ordinary memory, since jCardSim 3.0.5 has
@@ -144,6 +158,12 @@
           configFile = ./metadata.json;
           flakeInputs = inputs;
         }).packages.${system}
-        // lib.optionalAttrs (builtins.elem system systems) { simulator = simulator system; });
+        // lib.optionalAttrs (builtins.elem system systems) {
+          simulator = simulator system;
+          unit-tests = unitTests (import nixpkgs { inherit system; });
+        });
+      checks = lib.genAttrs systems (system: {
+        unit-tests = self.packages.${system}.unit-tests;
+      });
     };
 }
