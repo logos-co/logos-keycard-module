@@ -382,18 +382,24 @@ impl Shared {
     /// must not consume more slots or repeatedly try a password that already failed.
     fn pair_default(&self, card: &mut Card) -> Result<(), CardError> {
         let info = card.info();
-        if !self.auto_pairing.load(Ordering::SeqCst) || info.secure_channel != 1
-            || !info.initialized {
+        if !self.auto_pairing.load(Ordering::SeqCst)
+            || info.secure_channel != 1
+            || !info.initialized
+        {
             return Ok(());
         }
-        let Some(uid) = info.instance_uid else { return Ok(()) };
+        let Some(uid) = info.instance_uid else {
+            return Ok(());
+        };
         if lock(&self.store).pairing(&uid).is_some()
-            || !lock(&self.default_pairing_attempted).insert(uid.clone()) {
+            || !lock(&self.default_pairing_attempted).insert(uid.clone())
+        {
             return Ok(());
         }
         let pairing = card.pair(crate::admin::DEFAULT_PAIRING_PASSWORD)?;
-        lock(&self.store).put_pairing(&uid, &pairing)
-            .map_err(|_| CardError::Link("Card paired, but the local pairing could not be saved".into()))
+        lock(&self.store).put_pairing(&uid, &pairing).map_err(|_| {
+            CardError::Link("Card paired, but the local pairing could not be saved".into())
+        })
     }
 
     /// SELECT the card and, once persistence is ready, pair a new 3.x card if possible.
@@ -405,10 +411,11 @@ impl Shared {
             .and_then(|ch| Card::select(ch, self.readers.trusted_cas(), self.trusted()));
         let (card, error, untrusted) = match looked {
             Ok(mut c) => {
-                let error = self.pair_default(&mut c).err().map(|e|
-                    format!("Automatic pairing could not complete: {e}. Pair this card manually."));
+                let error = self.pair_default(&mut c).err().map(|e| {
+                    format!("Automatic pairing could not complete: {e}. Pair this card manually.")
+                });
                 (Some(c.info()), error, None)
-            },
+            }
             Err(CardError::Untrusted(identity)) => {
                 (None, Some(CardError::Untrusted(None).to_string()), identity)
             }
@@ -436,7 +443,9 @@ impl Shared {
     /// Look at the readers, reading a card again only once it was inserted again.
     fn refresh_cards(&self) {
         let _scan = lock(&self.scan);
-        if self.busy.load(Ordering::SeqCst) { return; }
+        if self.busy.load(Ordering::SeqCst) {
+            return;
+        }
         let slots = self.readers.present();
         let have = lock(&self.cards).clone();
         let next: Vec<Present> = slots
@@ -484,13 +493,20 @@ impl Shared {
     fn reader_holding(&self, key_uid: &str, family: Family) -> Result<String, SignerError> {
         lock(&self.cards)
             .iter()
-            .filter(|p| p.card.as_ref().is_some_and(|c| c.key_uid.as_deref() == Some(key_uid)))
+            .filter(|p| {
+                p.card
+                    .as_ref()
+                    .is_some_and(|c| c.key_uid.as_deref() == Some(key_uid))
+            })
             .min_by_key(|p| {
                 let c = p.card.as_ref().expect("matching card");
                 // Prefer a usable connection, retaining a matching blocked/unpaired card
                 // as a fallback so its specific recovery error reaches the user.
-                (family == Family::BitcoinTaproot && !c.taproot,
-                 !(c.secure_channel == 2 || p.paired), c.pin_retries == Some(0))
+                (
+                    family == Family::BitcoinTaproot && !c.taproot,
+                    !(c.secure_channel == 2 || p.paired),
+                    c.pin_retries == Some(0),
+                )
             })
             .map(|p| p.reader.clone())
             .ok_or_else(|| {
@@ -558,11 +574,16 @@ impl Shared {
         let s = Arc::clone(self);
         std::thread::spawn(move || {
             let opened = s.open(&reader).and_then(|mut card| {
-                if expected_card.as_ref().is_some_and(|id| match id.strip_prefix("seed:") {
-                    Some(uid) => card.info().key_uid.as_deref() != Some(uid),
-                    None => card.info().id().as_ref() != Some(id),
-                }) {
-                    return Err(CardError::Link("The card in the reader changed. Insert the selected Keycard.".into()));
+                if expected_card
+                    .as_ref()
+                    .is_some_and(|id| match id.strip_prefix("seed:") {
+                        Some(uid) => card.info().key_uid.as_deref() != Some(uid),
+                        None => card.info().id().as_ref() != Some(id),
+                    })
+                {
+                    return Err(CardError::Link(
+                        "The card in the reader changed. Insert the selected Keycard.".into(),
+                    ));
                 }
                 card.verify_pin(pin.expose())?;
                 Ok(card)
@@ -677,9 +698,20 @@ pub struct KeycardSigner {
 }
 
 impl KeycardSigner {
-    pub fn sign_offered(&mut self, request: SignRequest, offered: Offered) -> logos_signer_interface::Result<String> {
-        if !(if offered.account.family == Family::Evm { request.account.eq_ignore_ascii_case(&offered.account.id) } else { request.account == offered.account.id }) {
-            return Err(err(ErrorCode::Invalid, "Routed account does not match the request"));
+    pub fn sign_offered(
+        &mut self,
+        request: SignRequest,
+        offered: Offered,
+    ) -> logos_signer_interface::Result<String> {
+        if !(if offered.account.family == Family::Evm {
+            request.account.eq_ignore_ascii_case(&offered.account.id)
+        } else {
+            request.account == offered.account.id
+        }) {
+            return Err(err(
+                ErrorCode::Invalid,
+                "Routed account does not match the request",
+            ));
         }
         let Payload::Hash { items } = request.payload else {
             return Err(err(
@@ -693,7 +725,9 @@ impl KeycardSigner {
             .ok_or_else(|| err(ErrorCode::Locked, "enter the Keycard's PIN"))?;
         digits(&pin, 6, "PIN")?;
         self.s.refresh_if_idle();
-        let reader = self.s.reader_holding(&offered.key_uid, offered.account.family)?;
+        let reader = self
+            .s
+            .reader_holding(&offered.key_uid, offered.account.family)?;
         let hold = self.s.hold()?;
         let (job_tx, job_rx) = mpsc::channel::<String>();
         let root_id = offered.key_uid.clone();
@@ -705,13 +739,20 @@ impl KeycardSigner {
             Some(format!("seed:{}", offered.key_uid)),
             move |card| {
                 let job = job_rx.recv().ok()?;
-                let outcome = card.export_public("m").map_err(card_error).and_then(|root| {
-                    use bitcoin::hashes::{sha256, Hash};
-                    if sha256::Hash::hash(&root.serialize_uncompressed()).to_string() != root_id {
-                        return Err(err(ErrorCode::Unavailable, "The alternate PIN opened a different seed"));
-                    }
-                    run(card, &account, &items, steps)
-                });
+                let outcome = card
+                    .export_public("m")
+                    .map_err(card_error)
+                    .and_then(|root| {
+                        use bitcoin::hashes::{sha256, Hash};
+                        if sha256::Hash::hash(&root.serialize_uncompressed()).to_string() != root_id
+                        {
+                            return Err(err(
+                                ErrorCode::Unavailable,
+                                "The alternate PIN opened a different seed",
+                            ));
+                        }
+                        run(card, &account, &items, steps)
+                    });
                 Some((job, outcome))
             },
             |s, done| {
@@ -732,9 +773,19 @@ impl KeycardSigner {
     }
 
     pub fn routing_accounts(&self) -> serde_json::Value {
-        lock(&self.s.store).list().iter().map(|o| (o.account.id.clone(), serde_json::json!({
-            "account": o.account, "masterKeyId": o.key_uid, "key": o.key
-        }))).collect::<serde_json::Map<String, serde_json::Value>>().into()
+        lock(&self.s.store)
+            .list()
+            .iter()
+            .map(|o| {
+                (
+                    o.account.id.clone(),
+                    serde_json::json!({
+                        "account": o.account, "masterKeyId": o.key_uid, "key": o.key
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<String, serde_json::Value>>()
+            .into()
     }
     pub fn routing_connections(&self) -> serde_json::Value {
         let cards = self.cards();
@@ -787,7 +838,9 @@ impl KeycardSigner {
             *lock(&self.s.store) = store;
             self.s.auto_pairing.store(true, Ordering::SeqCst);
             // The initial scan ran before persistence existed; recheck saved pairings.
-            for p in lock(&self.s.cards).iter_mut() { p.epoch = None; }
+            for p in lock(&self.s.cards).iter_mut() {
+                p.epoch = None;
+            }
         }
         self.s.refresh_if_idle();
         self.s
@@ -823,47 +876,91 @@ impl KeycardSigner {
         let store = lock(&self.s.store);
         let mut groups = std::collections::BTreeMap::<String, CardGroup>::new();
         for saved in store.cards() {
-            let current = present.iter().find_map(|p| p.card.as_ref()
-                .filter(|c| c.id().as_deref() == Some(&saved.id)).map(|c| (p, c)));
-            let uids = if saved.key_uids.is_empty() { vec![String::new()] } else { saved.key_uids.clone() };
+            let current = present.iter().find_map(|p| {
+                p.card
+                    .as_ref()
+                    .filter(|c| c.id().as_deref() == Some(&saved.id))
+                    .map(|c| (p, c))
+            });
+            let uids = if saved.key_uids.is_empty() {
+                vec![String::new()]
+            } else {
+                saved.key_uids.clone()
+            };
             for uid in uids {
-                let id = if uid.is_empty() { saved.id.clone() } else { format!("seed:{uid}") };
-                let connected = current.is_some_and(|(_, c)| uid.is_empty() || c.key_uid.as_deref() == Some(&uid));
+                let id = if uid.is_empty() {
+                    saved.id.clone()
+                } else {
+                    format!("seed:{uid}")
+                };
+                let connected = current
+                    .is_some_and(|(_, c)| uid.is_empty() || c.key_uid.as_deref() == Some(&uid));
                 let g = groups.entry(id.clone()).or_insert_with(|| CardGroup {
-                    id, name: if uid.is_empty() { saved.name.clone() } else { store.wallet_name(&uid) },
-                    version: saved.version.clone(), connected: false, legacy: false,
-                    accounts: vec![], connections: vec![], aliases: vec![],
+                    id,
+                    name: if uid.is_empty() {
+                        saved.name.clone()
+                    } else {
+                        store.wallet_name(&uid)
+                    },
+                    version: saved.version.clone(),
+                    connected: false,
+                    legacy: false,
+                    accounts: vec![],
+                    connections: vec![],
+                    aliases: vec![],
                 });
                 g.connected |= connected;
-                if !saved.name.is_empty() && !g.aliases.contains(&saved.name) { g.aliases.push(saved.name.clone()); }
+                if !saved.name.is_empty() && !g.aliases.contains(&saved.name) {
+                    g.aliases.push(saved.name.clone());
+                }
                 g.connections.push(serde_json::json!({"id": saved.id, "transport": "reader",
                     "connected": connected, "reader": current.map(|(p, _)| p.reader.clone()).unwrap_or_default()}));
             }
         }
         for o in store.list() {
             let id = format!("seed:{}", o.key_uid);
-            let available = present.iter().any(|p| p.card.as_ref().is_some_and(|c| c.key_uid.as_deref() == Some(&o.key_uid)));
+            let available = present.iter().any(|p| {
+                p.card
+                    .as_ref()
+                    .is_some_and(|c| c.key_uid.as_deref() == Some(&o.key_uid))
+            });
             let g = groups.entry(id.clone()).or_insert_with(|| CardGroup {
-                id, name: store.wallet_name(&o.key_uid), version: String::new(), connected: false,
-                legacy: false, accounts: vec![], connections: vec![], aliases: vec![],
+                id,
+                name: store.wallet_name(&o.key_uid),
+                version: String::new(),
+                connected: false,
+                legacy: false,
+                accounts: vec![],
+                connections: vec![],
+                aliases: vec![],
             });
             g.connected |= available;
-            g.accounts.push(Account { available, ..o.account.clone() });
+            g.accounts.push(Account {
+                available,
+                ..o.account.clone()
+            });
         }
         groups.into_values().collect()
     }
 
     pub fn rename_account(&self, id: &str, name: &str) -> Result<(), SignerError> {
-        lock(&self.s.store).rename_account(id, name)
+        lock(&self.s.store)
+            .rename_account(id, name)
             .map_err(|e| err(ErrorCode::Invalid, e.to_string()))?;
-        self.s.events.accounts_changed(lock(&self.s.store).list().len());
+        self.s
+            .events
+            .accounts_changed(lock(&self.s.store).list().len());
         Ok(())
     }
 
     pub fn rename_card(&self, id: &str, name: &str) -> Result<(), SignerError> {
         if let Some(uid) = id.strip_prefix("seed:") {
-            lock(&self.s.store).rename_wallet(uid, name).map_err(|e| err(ErrorCode::Invalid, e.to_string()))?;
-            self.s.events.accounts_changed(lock(&self.s.store).list().len());
+            lock(&self.s.store)
+                .rename_wallet(uid, name)
+                .map_err(|e| err(ErrorCode::Invalid, e.to_string()))?;
+            self.s
+                .events
+                .accounts_changed(lock(&self.s.store).list().len());
             return Ok(());
         }
         lock(&self.s.store)
@@ -880,11 +977,22 @@ impl KeycardSigner {
         if let Some(uid) = id.strip_prefix("seed:") {
             let _hold = self.s.hold()?;
             self.s.refresh_cards();
-            if lock(&self.s.cards).iter().any(|p| p.card.as_ref().is_some_and(|c| c.key_uid.as_deref() == Some(uid))) {
-                return Err(err(ErrorCode::Invalid, "Remove this wallet's Keycards from their readers before forgetting it."));
+            if lock(&self.s.cards).iter().any(|p| {
+                p.card
+                    .as_ref()
+                    .is_some_and(|c| c.key_uid.as_deref() == Some(uid))
+            }) {
+                return Err(err(
+                    ErrorCode::Invalid,
+                    "Remove this wallet's Keycards from their readers before forgetting it.",
+                ));
             }
-            lock(&self.s.store).forget_wallet(uid).map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
-            self.s.events.accounts_changed(lock(&self.s.store).list().len());
+            lock(&self.s.store)
+                .forget_wallet(uid)
+                .map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
+            self.s
+                .events
+                .accounts_changed(lock(&self.s.store).list().len());
             return Ok(());
         }
         let _hold = self.s.hold()?;
@@ -1002,34 +1110,72 @@ impl KeycardSigner {
         self.s.refresh_if_idle();
         let hold = self.s.hold()?;
         let result = (|| {
-            let channel = self.s.readers.connect(&req.reader, false).map_err(|e| card_error(CardError::Link(e)))?;
-            let mut card = Card::select(channel, self.s.readers.trusted_cas(), self.s.trusted()).map_err(card_error)?;
+            let channel = self
+                .s
+                .readers
+                .connect(&req.reader, false)
+                .map_err(|e| card_error(CardError::Link(e)))?;
+            let mut card = Card::select(channel, self.s.readers.trusted_cas(), self.s.trusted())
+                .map_err(card_error)?;
             let info = card.info();
-            if info.admin_id != req.card_id || info.key_uid.as_deref().unwrap_or("") != req.key_uid {
+            if info.admin_id != req.card_id || info.key_uid.as_deref().unwrap_or("") != req.key_uid
+            {
                 return Err(err(ErrorCode::Invalid, "The card or its wallet changed. Reopen Card administration and review the selected card."));
             }
-            let pairing = info.instance_uid.as_deref().and_then(|uid| lock(&self.s.store).pairing(uid));
+            let pairing = info
+                .instance_uid
+                .as_deref()
+                .and_then(|uid| lock(&self.s.store).pairing(uid));
             if req.action == Action::Pair {
                 let paired = card.pair(req.pairing_password()).map_err(card_error)?;
-                lock(&self.s.store).put_pairing(info.instance_uid.as_deref().ok_or_else(|| err(ErrorCode::Unsupported, "This card needs no pairing"))?, &paired)
-                    .map_err(|_| err(ErrorCode::Internal, "Card paired, but the local pairing could not be saved"))?;
+                lock(&self.s.store)
+                    .put_pairing(
+                        info.instance_uid.as_deref().ok_or_else(|| {
+                            err(ErrorCode::Unsupported, "This card needs no pairing")
+                        })?,
+                        &paired,
+                    )
+                    .map_err(|_| {
+                        err(
+                            ErrorCode::Internal,
+                            "Card paired, but the local pairing could not be saved",
+                        )
+                    })?;
                 return Ok(serde_json::json!({"message":"Card paired with this app."}));
             }
             if req.action == Action::CheckIdentity {
                 if info.secure_channel == 2 {
                     card.open(None).map_err(card_error)?;
-                    return Ok(serde_json::json!({"genuine":!info.trusted_by_person, "message":if info.trusted_by_person {
+                    return Ok(
+                        serde_json::json!({"genuine":!info.trusted_by_person, "message":if info.trusted_by_person {
                         "Card proved its identity, but Keycard did not certify it. You trusted it manually."
-                    } else { "Card identity verified against a trusted Keycard certificate." }}));
+                    } else { "Card identity verified against a trusted Keycard certificate." }}),
+                    );
                 }
                 let mut challenge = [0u8; 32];
-                getrandom::getrandom(&mut challenge).map_err(|_| err(ErrorCode::Internal, "Could not generate identity challenge"))?;
-                let r = card.cmd.identify_card(&challenge).map_err(|_| err(ErrorCode::Unavailable, "Card identity request failed"))?;
-                if r.sw() != 0x9000 { return Err(err(ErrorCode::Unavailable, "This card did not provide an identity proof")); }
+                getrandom::getrandom(&mut challenge).map_err(|_| {
+                    err(ErrorCode::Internal, "Could not generate identity challenge")
+                })?;
+                let r = card
+                    .cmd
+                    .identify_card(&challenge)
+                    .map_err(|_| err(ErrorCode::Unavailable, "Card identity request failed"))?;
+                if r.sw() != 0x9000 {
+                    return Err(err(
+                        ErrorCode::Unavailable,
+                        "This card did not provide an identity proof",
+                    ));
+                }
                 let ca = keycard_rs::parsing::Certificate::verify_identity(&challenge, r.data())
-                    .ok().and_then(|bytes| PublicKey::from_slice(&bytes).ok())
+                    .ok()
+                    .and_then(|bytes| PublicKey::from_slice(&bytes).ok())
                     .ok_or_else(|| err(ErrorCode::Invalid, "Card identity proof is invalid"))?;
-                let genuine = self.s.readers.trusted_cas().iter().any(|key| PublicKey::from_slice(key).ok() == Some(ca));
+                let genuine = self
+                    .s
+                    .readers
+                    .trusted_cas()
+                    .iter()
+                    .any(|key| PublicKey::from_slice(key).ok() == Some(ca));
                 return Ok(serde_json::json!({"genuine":genuine, "message":if genuine {
                     "Card identity verified against a trusted Keycard certificate."
                 } else { "The identity proof is valid, but its issuer is not a trusted Keycard authority." }}));
@@ -1037,13 +1183,22 @@ impl KeycardSigner {
             let current_slot = pairing.as_ref().map(|p| p.pairing_index());
             if !matches!(req.action, Action::Initialize | Action::FactoryReset) {
                 card.open(pairing).map_err(card_error)?;
-                if req.needs_pin() { card.verify_pin(req.pin()).map_err(card_error)?; }
+                if req.needs_pin() {
+                    card.verify_pin(req.pin()).map_err(card_error)?;
+                }
             }
             let result = crate::admin::execute(&mut card, &req).map_err(card_error)?;
-            if req.action == Action::FactoryReset || (req.action == Action::Unpair && req.slot == current_slot) {
+            if req.action == Action::FactoryReset
+                || (req.action == Action::Unpair && req.slot == current_slot)
+            {
                 if let Some(uid) = &info.instance_uid {
                     lock(&self.s.default_pairing_attempted).insert(uid.clone());
-                    lock(&self.s.store).remove_pairing(uid).map_err(|_| err(ErrorCode::Internal, "Card changed, but the old local pairing could not be removed"))?;
+                    lock(&self.s.store).remove_pairing(uid).map_err(|_| {
+                        err(
+                            ErrorCode::Internal,
+                            "Card changed, but the old local pairing could not be removed",
+                        )
+                    })?;
                 }
             }
             Ok(result)
@@ -1052,7 +1207,9 @@ impl KeycardSigner {
         drop(hold);
         self.s.refresh_cards();
         // Keep old offers and names: other cards may still hold their seed.
-        self.s.events.accounts_changed(lock(&self.s.store).list().len());
+        self.s
+            .events
+            .accounts_changed(lock(&self.s.store).list().len());
         result
     }
 
@@ -1234,7 +1391,9 @@ mod grouping_tests {
 
     fn card(id: &str, seed: &str, v2: bool) -> CardInfo {
         CardInfo {
-            admin_id: id.into(), capabilities: 31, free_pairing_slots: 0,
+            admin_id: id.into(),
+            capabilities: 31,
+            free_pairing_slots: 0,
             version: if v2 { "4.0" } else { "3.1" }.into(),
             initialized: true,
             key_uid: Some(seed.into()),
@@ -1485,7 +1644,9 @@ mod grouping_tests {
         let mut expected = offered();
         let id = expected.account.id.clone();
         store.put(vec![expected.clone()]).unwrap();
-        store.rename_account(&id.to_uppercase(), "  Travel ETH  ").unwrap();
+        store
+            .rename_account(&id.to_uppercase(), "  Travel ETH  ")
+            .unwrap();
         expected.account.label = Some("Travel ETH".into());
         assert_eq!(Store::open(&dir).unwrap().find(&id), Some(&expected));
         assert!(store.rename_account("unknown", "Other").is_err());
@@ -1500,5 +1661,4 @@ mod grouping_tests {
         assert_eq!(store.find(&id), Some(&expected));
         std::fs::remove_file(dir).unwrap();
     }
-
 }

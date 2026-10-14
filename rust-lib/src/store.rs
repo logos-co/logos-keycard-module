@@ -3,8 +3,8 @@
 //! only this user may read; and `trusted_cards.json`, the identity keys of the 4.0 cards Keycard
 //! didn't sign that the person chose to trust.
 
-use std::path::{Path, PathBuf};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use crate::card::CardInfo;
 use keycard_rs::Pairing;
@@ -119,22 +119,34 @@ impl Store {
     }
 
     pub fn wallet_name(&self, uid: &str) -> String {
-        self.wallet_names.get(uid).cloned().unwrap_or_else(||
-            self.cards.iter().find(|c| c.key_uids.iter().any(|k| k == uid) && !c.name.is_empty())
-                .map(|c| c.name.clone()).unwrap_or_default())
+        self.wallet_names.get(uid).cloned().unwrap_or_else(|| {
+            self.cards
+                .iter()
+                .find(|c| c.key_uids.iter().any(|k| k == uid) && !c.name.is_empty())
+                .map(|c| c.name.clone())
+                .unwrap_or_default()
+        })
     }
 
     pub fn rename_wallet(&mut self, uid: &str, name: &str) -> std::io::Result<()> {
         let name = name.trim();
-        if name.chars().count() > 80 || name.chars().any(char::is_control)
-            || !(self.cards.iter().any(|c| c.key_uids.iter().any(|k| k == uid))
-                || self.offered.iter().any(|o| o.key_uid == uid)) {
+        if name.chars().count() > 80
+            || name.chars().any(char::is_control)
+            || !(self
+                .cards
+                .iter()
+                .any(|c| c.key_uids.iter().any(|k| k == uid))
+                || self.offered.iter().any(|o| o.key_uid == uid))
+        {
             return Err(std::io::Error::other("Unknown wallet or invalid name"));
         }
         let mut next = self.wallet_names.clone();
         next.insert(uid.into(), name.into());
         if let Some(dir) = &self.dir {
-            write(&dir.join("wallet_names.json"), &serde_json::to_vec_pretty(&next)?)?;
+            write(
+                &dir.join("wallet_names.json"),
+                &serde_json::to_vec_pretty(&next)?,
+            )?;
         }
         self.wallet_names = next;
         Ok(())
@@ -144,7 +156,12 @@ impl Store {
         let mut next = self.offered.clone();
         next.retain(|o| o.key_uid != uid);
         if let Some(dir) = &self.dir {
-            write(&dir.join("accounts.json"), &serde_json::to_vec_pretty(&Accounts { accounts: next.clone() })?)?;
+            write(
+                &dir.join("accounts.json"),
+                &serde_json::to_vec_pretty(&Accounts {
+                    accounts: next.clone(),
+                })?,
+            )?;
         }
         self.offered = next;
         let mut cards = self.cards.clone();
@@ -156,7 +173,12 @@ impl Store {
         self.save_cards(cards)?;
         let mut names = self.wallet_names.clone();
         names.remove(uid);
-        if let Some(dir) = &self.dir { write(&dir.join("wallet_names.json"), &serde_json::to_vec_pretty(&names)?)?; }
+        if let Some(dir) = &self.dir {
+            write(
+                &dir.join("wallet_names.json"),
+                &serde_json::to_vec_pretty(&names)?,
+            )?;
+        }
         self.wallet_names = names;
         Ok(())
     }
@@ -298,8 +320,13 @@ impl Store {
     /// Add or replace accounts by id, and save.
     pub fn put(&mut self, add: Vec<Offered>) -> std::io::Result<()> {
         for o in &add {
-            if self.find(&o.account.id).is_some_and(|old| old.key != o.key || old.key_uid != o.key_uid) {
-                return Err(std::io::Error::other("Account identifier belongs to another key; existing account was kept"));
+            if self
+                .find(&o.account.id)
+                .is_some_and(|old| old.key != o.key || old.key_uid != o.key_uid)
+            {
+                return Err(std::io::Error::other(
+                    "Account identifier belongs to another key; existing account was kept",
+                ));
             }
         }
         let previous = self.offered.clone();
@@ -309,11 +336,17 @@ impl Store {
                 .iter_mut()
                 .find(|have| same(&have.account, &o.account.id))
             {
-                Some(have) => { o.account.label = have.account.label.clone(); *have = o; },
+                Some(have) => {
+                    o.account.label = have.account.label.clone();
+                    *have = o;
+                }
                 None => self.offered.push(o),
             }
         }
-        if let Err(e) = self.save_accounts() { self.offered = previous; return Err(e); }
+        if let Err(e) = self.save_accounts() {
+            self.offered = previous;
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -321,9 +354,14 @@ impl Store {
     pub fn rename_account(&mut self, id: &str, name: &str) -> std::io::Result<()> {
         let name = name.trim();
         if name.chars().count() > 80 || name.chars().any(char::is_control) {
-            return Err(std::io::Error::other("Account names must be at most 80 characters, without control characters"));
+            return Err(std::io::Error::other(
+                "Account names must be at most 80 characters, without control characters",
+            ));
         }
-        let index = self.offered.iter().position(|o| same(&o.account, id))
+        let index = self
+            .offered
+            .iter()
+            .position(|o| same(&o.account, id))
             .ok_or_else(|| std::io::Error::other("Unknown account"))?;
         let previous = self.offered[index].account.label.clone();
         self.offered[index].account.label = (!name.is_empty()).then(|| name.to_owned());

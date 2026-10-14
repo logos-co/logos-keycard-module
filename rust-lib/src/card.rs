@@ -45,9 +45,9 @@ impl std::fmt::Display for CardError {
             CardError::Untrusted(_) => {
                 f.write_str("this card's identity is not signed by Keycard: it may not be genuine")
             }
-            CardError::NotInitialized => {
-                f.write_str("this Keycard is not set up yet: open Card administration to set its PIN")
-            }
+            CardError::NotInitialized => f.write_str(
+                "this Keycard is not set up yet: open Card administration to set its PIN",
+            ),
             CardError::NoKey => f.write_str(
                 "this Keycard holds no key yet: create or import one in Card administration",
             ),
@@ -134,11 +134,18 @@ impl CardInfo {
         let v2 = info.app_version() >= 0x0400;
         CardInfo {
             version: info.app_version_string(),
-            admin_id: certificate(info).map(|c| format!("identity:{}", hex::encode(c.ident_pub())))
-                .or_else(|| info.instance_uid().map(|v| format!("instance:{}", hex::encode(v))))
+            admin_id: certificate(info)
+                .map(|c| format!("identity:{}", hex::encode(c.ident_pub())))
+                .or_else(|| {
+                    info.instance_uid()
+                        .map(|v| format!("instance:{}", hex::encode(v)))
+                })
                 .unwrap_or_else(|| {
                     use bitcoin::hashes::{sha256, Hash};
-                    format!("setup:{}", sha256::Hash::hash(info.secure_channel_pub_key().unwrap_or_default()))
+                    format!(
+                        "setup:{}",
+                        sha256::Hash::hash(info.secure_channel_pub_key().unwrap_or_default())
+                    )
                 }),
             capabilities: info.capabilities(),
             free_pairing_slots: info.free_pairing_slots(),

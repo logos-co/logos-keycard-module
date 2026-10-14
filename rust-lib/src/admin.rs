@@ -416,13 +416,22 @@ mod tests {
     }
     #[test]
     fn setup_defaults_pairing_but_preserves_explicit_custom_passwords() {
-        let default = request("initialize", json!({"newPin":"123456","puk":"987654321098"}));
+        let default = request(
+            "initialize",
+            json!({"newPin":"123456","puk":"987654321098"}),
+        );
         assert!(default.validate().is_ok());
         assert_eq!(default.pairing_password(), DEFAULT_PAIRING_PASSWORD);
-        let custom = request("initialize", json!({"newPin":"123456","puk":"987654321098","pairingPassword":"custom password"}));
+        let custom = request(
+            "initialize",
+            json!({"newPin":"123456","puk":"987654321098","pairingPassword":"custom password"}),
+        );
         assert!(custom.validate().is_ok());
         assert_eq!(custom.pairing_password(), "custom password");
-        let empty = request("initialize", json!({"newPin":"123456","puk":"987654321098","pairingPassword":""}));
+        let empty = request(
+            "initialize",
+            json!({"newPin":"123456","puk":"987654321098","pairingPassword":""}),
+        );
         assert!(empty.validate().is_err());
         assert!(request("pair", json!({})).validate().is_err());
     }

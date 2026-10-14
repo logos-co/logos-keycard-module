@@ -124,25 +124,51 @@ pub fn bitcoin_account(
 /// A public-only display preview. Bitcoin accounts contain many addresses; preview /0/0
 /// without changing their signer identity or requiring the card to be present.
 pub fn address_preview(account: &Account) -> Result<serde_json::Value, &'static str> {
-    use std::str::FromStr;
-    use bitcoin::{Address, CompressedPublicKey, Network};
     use bitcoin::secp256k1::Secp256k1;
+    use bitcoin::{Address, CompressedPublicKey, Network};
+    use std::str::FromStr;
     if account.family == Family::Evm {
-        return Ok(serde_json::json!({"address": account.address.as_deref().ok_or("Address unavailable")?,
-            "path": account.path, "firstReceiving": false}));
+        return Ok(
+            serde_json::json!({"address": account.address.as_deref().ok_or("Address unavailable")?,
+            "path": account.path, "firstReceiving": false}),
+        );
     }
     let chain = account.chain.ok_or("Bitcoin network unavailable")?;
-    let xpub = Xpub::from_str(account.xpub.as_deref().ok_or("Account public key unavailable")?)
-        .map_err(|_| "Invalid account public key")?;
-    let expected = if chain == Chain::Main { NetworkKind::Main } else { NetworkKind::Test };
-    if xpub.network != expected { return Err("Account public key network mismatch"); }
+    let xpub = Xpub::from_str(
+        account
+            .xpub
+            .as_deref()
+            .ok_or("Account public key unavailable")?,
+    )
+    .map_err(|_| "Invalid account public key")?;
+    let expected = if chain == Chain::Main {
+        NetworkKind::Main
+    } else {
+        NetworkKind::Test
+    };
+    if xpub.network != expected {
+        return Err("Account public key network mismatch");
+    }
     let secp = Secp256k1::verification_only();
-    let child = xpub.derive_pub(&secp, &[ChildNumber::Normal {index:0}, ChildNumber::Normal {index:0}])
+    let child = xpub
+        .derive_pub(
+            &secp,
+            &[
+                ChildNumber::Normal { index: 0 },
+                ChildNumber::Normal { index: 0 },
+            ],
+        )
         .map_err(|_| "Could not derive the receiving address")?;
-    let network = if chain == Chain::Main { Network::Bitcoin } else { Network::Testnet };
+    let network = if chain == Chain::Main {
+        Network::Bitcoin
+    } else {
+        Network::Testnet
+    };
     let address = match account.family {
         Family::Bitcoin => Address::p2wpkh(&CompressedPublicKey(child.public_key), network),
-        Family::BitcoinTaproot => Address::p2tr(&secp, child.public_key.x_only_public_key().0, None, network),
+        Family::BitcoinTaproot => {
+            Address::p2tr(&secp, child.public_key.x_only_public_key().0, None, network)
+        }
         Family::Evm => unreachable!(),
     };
     Ok(serde_json::json!({"address": address.to_string(),
