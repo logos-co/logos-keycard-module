@@ -105,6 +105,7 @@ fn add_request(families: Vec<Family>, chain: Chain) -> AddRequest {
         account: 0,
         label: None,
         reader: None,
+        card_id: None,
         pin: Secret::new(PIN),
     }
 }
@@ -160,6 +161,48 @@ fn its_accounts_are_the_published_ones_for_the_test_phrase() {
     let bip84 = bitcoin::base58::decode_check(BIP84_ZPUB).unwrap();
     assert_eq!(&ours[4..], &bip84[4..]);
     assert_eq!(got[2].xpub.as_deref(), Some(BIP86_XPUB));
+    // Published BIP84/BIP86 first-receive vectors, not addresses computed by our helper.
+    assert_eq!(
+        accounts::address_preview(&got[0]).unwrap()["address"],
+        got[0].address.as_deref().unwrap()
+    );
+    assert_eq!(
+        accounts::address_preview(&got[0]).unwrap()["path"],
+        accounts::EVM_PATH
+    );
+    assert_eq!(
+        accounts::address_preview(&got[1]).unwrap()["address"],
+        "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu"
+    );
+    assert_eq!(
+        accounts::address_preview(&got[1]).unwrap()["path"],
+        "m/84'/0'/0'/0/0"
+    );
+    assert_eq!(
+        accounts::address_preview(&got[2]).unwrap()["address"],
+        "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr"
+    );
+    let mut offline = got[2].clone();
+    offline.available = false;
+    assert_eq!(
+        accounts::address_preview(&offline).unwrap(),
+        accounts::address_preview(&got[2]).unwrap()
+    );
+    offline.chain = Some(Chain::Test);
+    assert!(
+        accounts::address_preview(&offline).is_err(),
+        "mismatched networks must not produce a copyable address"
+    );
+    let mut test_xpub = Xpub::from_str(offline.xpub.as_ref().unwrap()).unwrap();
+    test_xpub.network = bitcoin::NetworkKind::Test;
+    offline.xpub = Some(test_xpub.to_string());
+    assert!(accounts::address_preview(&offline).unwrap()["address"]
+        .as_str()
+        .unwrap()
+        .starts_with("tb1p"));
+    offline.xpub = Some("invalid".into());
+    assert!(accounts::address_preview(&offline).is_err());
+
     let fingerprint = hex::encode(Xpub::from_priv(&secp, &root).fingerprint().to_bytes());
     assert_eq!(got[1].fingerprint.as_deref(), Some(fingerprint.as_str()));
     assert_eq!(got[1].id, format!("keycard-{fingerprint}-84-0-0"));
@@ -448,4 +491,509 @@ fn a_card_keycard_did_not_sign_is_used_only_once_the_person_trusts_it() {
     let other = k.cards().remove(0);
     assert!(other.card.is_none(), "{other:?}");
     assert!(other.untrusted.is_some() && other.untrusted != Some(identity));
+}
+
+#[test]
+fn additional_evm_accounts_use_the_requested_path_and_reject_a_swapped_card() {
+    let Some(addr) = simulator() else { return };
+    let _turn = turn();
+    let mut k = rig(&addr, &Setup::default());
+    let first = add(&k, vec![Family::Evm], Chain::Main).remove(0);
+    let mut req = add_request(vec![Family::Evm], Chain::Main);
+    req.account = 1;
+    req.card_id = Some("instance:not-the-selected-card".into());
+    assert!(k.add_accounts(req.clone()).is_err());
+    req.card_id = None;
+    let second = exported(&k, req).unwrap().remove(0);
+    assert_ne!(first.id, second.id);
+    assert_eq!(second.path.as_deref(), Some("m/44'/60'/0'/0/1"));
+    let req = request(&second, Some(PIN));
+    let job = k.sign(req.clone()).unwrap();
+    assert_eq!(settle(&mut k, &job), JobState::Done);
+    let signatures = k.result(&job).unwrap();
+    let Payload::Hash { items } = req.payload else {
+        panic!("hash request")
+    };
+    for signature in &signatures {
+        verify::check(&second, &items[signature.item], signature).unwrap();
+    }
+}
+
+#[test]
+fn applet_seed_identity_matches_hash_of_full_uncompressed_master_public_key() {
+    use bitcoin::hashes::{sha256, Hash};
+    let Some(addr) = simulator() else { return };
+    let _turn = turn();
+    let k = rig(&addr, &Setup::default());
+    let root = Xpriv::from_str(BIP86_ROOTPRIV)
+        .unwrap()
+        .private_key
+        .public_key(&Secp256k1::new());
+    let expected = sha256::Hash::hash(&root.serialize_uncompressed()).to_string();
+    assert_eq!(
+        k.cards()[0].card.as_ref().unwrap().key_uid.as_deref(),
+        Some(expected.as_str())
+    );
+    assert_eq!(k.card_groups()[0].id, format!("seed:{expected}"));
+}
+
+#[test]
+fn a_public_offer_signs_through_a_matching_reader_without_importing_it() {
+    let Some(addr) = simulator() else { return };
+    let _turn = turn();
+    let source = rig(&addr, &Setup::default());
+    let accounts = add(
+        &source,
+        vec![Family::Evm, Family::Bitcoin, Family::BitcoinTaproot],
+        Chain::Test,
+    );
+    let offers = source.routing_accounts();
+    let mut target = KeycardSigner::new(
+        Box::new(Simulator::new(&addr)),
+        Store::new(),
+        Box::new(Quiet),
+    );
+    for a in accounts {
+        let v = &offers[&a.id];
+        let offer = keycard_module::store::Offered {
+            account: a.clone(),
+            key_uid: v["masterKeyId"].as_str().unwrap().into(),
+            key: v["key"].as_str().unwrap().into(),
+        };
+        let req = request(&a, Some(PIN));
+        let Payload::Hash { items } = req.payload.clone() else {
+            unreachable!()
+        };
+        let job = target.sign_offered(req, offer).unwrap();
+        assert_eq!(settle(&mut target, &job), JobState::Done);
+        for (item, sig) in items.iter().zip(target.result(&job).unwrap()) {
+            verify::check(&a, item, &sig).unwrap();
+        }
+    }
+    assert!(
+        target.accounts().unwrap().is_empty(),
+        "routing must not persist duplicate accounts"
+    );
+}
+
+// Administration only: these tests never sign and never access a real reader.
+fn admin_request(
+    k: &KeycardSigner,
+    action: &str,
+    extra: serde_json::Value,
+) -> keycard_module::admin::Request {
+    let p = k.cards().into_iter().find(|p| p.card.is_some()).unwrap();
+    let c = p.card.unwrap();
+    let mut v = serde_json::json!({"action":action,"reader":p.reader,"cardId":c.admin_id,"keyUid":c.key_uid.unwrap_or_default()});
+    for (key, value) in extra.as_object().unwrap() {
+        v[key] = value.clone();
+    }
+    serde_json::from_value(v).unwrap()
+}
+fn admin(k: &KeycardSigner, action: &str, extra: serde_json::Value) -> serde_json::Value {
+    k.administer(admin_request(k, action, extra))
+        .unwrap_or_else(|e| panic!("{action}: {}", e.message))
+}
+
+#[test]
+fn administration_v4_lifecycle_and_exact_card_guards() {
+    let _turn = turn();
+    let Some(addr) = simulator() else { return };
+    let mut k = rig(&addr, &Setup::default());
+    let offers = add(&k, vec![Family::Evm], Chain::Main);
+    k.rename_account(&offers[0].id, "Keep my account name")
+        .unwrap();
+    assert_eq!(
+        admin(&k, "check_identity", serde_json::json!({}))["genuine"],
+        true
+    );
+    let original_uid = k.cards()[0].card.as_ref().unwrap().key_uid.clone();
+    let mut stale = admin_request(
+        &k,
+        "change_pin",
+        serde_json::json!({"pin":PIN,"newPin":"234567"}),
+    );
+    stale.card_id = "another-card".into();
+    assert!(k.administer(stale).unwrap_err().message.contains("changed"));
+    let mut stale_seed = admin_request(
+        &k,
+        "factory_reset",
+        serde_json::json!({"confirmation":"RESET"}),
+    );
+    stale_seed.key_uid = "another-seed".into();
+    assert!(k
+        .administer(stale_seed)
+        .unwrap_err()
+        .message
+        .contains("changed"));
+    let s = admin(&k, "status", serde_json::json!({}));
+    assert_eq!(s["pinRetries"], 3);
+    assert!(k
+        .administer(admin_request(&k, "factory_reset", serde_json::json!({})))
+        .is_err());
+    assert_eq!(k.cards()[0].card.as_ref().unwrap().key_uid, original_uid);
+    admin(
+        &k,
+        "verify_phrase",
+        serde_json::json!({"pin":PIN,"phrase":sim::TEST_PHRASE}),
+    );
+    assert!(
+        k.administer(admin_request(
+            &k,
+            "verify_phrase",
+            serde_json::json!({"pin":"987654","phrase":sim::TEST_PHRASE})
+        ))
+        .is_err(),
+        "Alternate wallet shares a master public key but has a different chain code"
+    );
+    assert!(k
+        .administer(admin_request(
+            &k,
+            "verify_phrase",
+            serde_json::json!({"pin":PIN,"phrase":sim::TEST_PHRASE,"passphrase":"different"})
+        ))
+        .is_err());
+    assert!(k
+        .administer(admin_request(
+            &k,
+            "load_phrase",
+            serde_json::json!({"pin":PIN,"phrase":sim::TEST_PHRASE,"confirmation":"BACKED UP"})
+        ))
+        .unwrap_err()
+        .message
+        .contains("already holds"));
+    admin(
+        &k,
+        "change_pin",
+        serde_json::json!({"pin":PIN,"newPin":"234567"}),
+    );
+    admin(
+        &k,
+        "change_puk",
+        serde_json::json!({"pin":"234567","puk":"876543210987"}),
+    );
+    admin(
+        &k,
+        "set_name",
+        serde_json::json!({"pin":"234567","text":"Travel card"}),
+    );
+    let data = admin(&k, "read_data", serde_json::json!({}));
+    let meta =
+        keycard_rs::Metadata::from_data(&hex::decode(data["data"].as_str().unwrap()).unwrap())
+            .unwrap();
+    assert_eq!(meta.card_name(), "Travel card");
+    admin(
+        &k,
+        "set_ndef",
+        serde_json::json!({"pin":"234567","text":"Public contact"}),
+    );
+    admin(
+        &k,
+        "set_ndef",
+        serde_json::json!({"pin":"234567","text":""}),
+    );
+    admin(
+        &k,
+        "write_data",
+        serde_json::json!({"pin":"234567","text":"deadbeef","dataType":2,"confirmation":"WRITE"}),
+    );
+    assert_eq!(
+        admin(&k, "read_data", serde_json::json!({"dataType":2}))["data"],
+        "deadbeef"
+    );
+    admin(
+        &k,
+        "remove_key",
+        serde_json::json!({"pin":"234567","confirmation":"ERASE"}),
+    );
+    assert!(k.cards()[0].card.as_ref().unwrap().key_uid.is_none());
+    let old = k.accounts().unwrap();
+    assert_eq!(old[0].label.as_deref(), Some("Keep my account name"));
+    assert!(!old[0].available);
+    let mut generated = admin(
+        &k,
+        "generate_phrase",
+        serde_json::json!({"pin":"234567","words":24}),
+    );
+    assert_eq!(
+        generated["phrase"]
+            .as_str()
+            .unwrap()
+            .split_whitespace()
+            .count(),
+        24
+    );
+    admin(
+        &k,
+        "load_phrase",
+        serde_json::json!({"pin":"234567","phrase":generated["phrase"],"confirmation":"BACKED UP","passphrase":"é"}),
+    );
+    // Unicode normalization is BIP39 compatible.
+    admin(
+        &k,
+        "verify_phrase",
+        serde_json::json!({"pin":"234567","phrase":generated["phrase"],"passphrase":"e\u{301}"}),
+    );
+    generated = serde_json::Value::Null;
+    let _ = generated;
+    admin(
+        &k,
+        "factory_reset",
+        serde_json::json!({"confirmation":"RESET"}),
+    );
+    assert!(!k.cards()[0].card.as_ref().unwrap().initialized);
+    admin(
+        &k,
+        "initialize",
+        serde_json::json!({"newPin":PIN,"puk":PUK,"alternatePin":"345678"}),
+    );
+    assert!(k.cards()[0].card.as_ref().unwrap().initialized);
+    admin(
+        &k,
+        "generate_key",
+        serde_json::json!({"pin":PIN,"confirmation":"NO BACKUP"}),
+    );
+    assert!(k.cards()[0].card.as_ref().unwrap().key_uid.is_some());
+    assert_eq!(
+        k.accounts().unwrap()[0].label.as_deref(),
+        Some("Keep my account name")
+    );
+}
+
+#[test]
+fn administration_v3_pairing_setup_and_recovery() {
+    let _turn = turn_v3();
+    let Some(addr) = named("KEYCARD_SIMULATOR_V3") else {
+        return;
+    };
+    let k = rig(&addr, &Setup::default());
+    admin(
+        &k,
+        "pair",
+        serde_json::json!({"pairingPassword":"KeycardDefaultPairing"}),
+    );
+    let status = admin(&k, "status", serde_json::json!({}));
+    let slot = status["pairingSlot"].as_u64().unwrap();
+    admin(
+        &k,
+        "change_pairing_password",
+        serde_json::json!({"pin":PIN,"pairingPassword":"new test password"}),
+    );
+    admin(&k, "unpair", serde_json::json!({"pin":PIN,"slot":slot}));
+    assert!(!k.cards()[0].paired);
+    admin(
+        &k,
+        "pair",
+        serde_json::json!({"pairingPassword":"new test password"}),
+    );
+    for _ in 0..3 {
+        assert!(k
+            .administer(admin_request(
+                &k,
+                "change_pin",
+                serde_json::json!({"pin":"999999","newPin":"234567"})
+            ))
+            .is_err());
+    }
+    admin(
+        &k,
+        "unblock_pin",
+        serde_json::json!({"puk":PUK,"newPin":"234567"}),
+    );
+    admin(
+        &k,
+        "verify_phrase",
+        serde_json::json!({"pin":"234567","phrase":sim::TEST_PHRASE}),
+    );
+    admin(
+        &k,
+        "factory_reset",
+        serde_json::json!({"confirmation":"RESET"}),
+    );
+    assert!(!k.cards()[0].paired);
+    admin(
+        &k,
+        "initialize",
+        serde_json::json!({"newPin":PIN,"puk":PUK,"pairingPassword":"fresh test password"}),
+    );
+    admin(
+        &k,
+        "pair",
+        serde_json::json!({"pairingPassword":"fresh test password"}),
+    );
+    for words in [12, 15, 18, 21, 24] {
+        let result = admin(
+            &k,
+            "generate_phrase",
+            serde_json::json!({"pin":PIN,"words":words}),
+        );
+        assert_eq!(
+            result["phrase"]
+                .as_str()
+                .unwrap()
+                .split_whitespace()
+                .count(),
+            words
+        );
+    }
+    admin(
+        &k,
+        "load_phrase",
+        serde_json::json!({"pin":PIN,"phrase":sim::TEST_PHRASE,"confirmation":"BACKED UP"}),
+    );
+    admin(
+        &k,
+        "verify_phrase",
+        serde_json::json!({"pin":PIN,"phrase":sim::TEST_PHRASE}),
+    );
+}
+
+#[test]
+fn default_pairing_waits_for_store_and_survives_restart() {
+    let Some(addr) = named("KEYCARD_SIMULATOR_V3") else {
+        return;
+    };
+    let _turn = turn_v3();
+    let k = rig(&addr, &Setup::default());
+    assert!(!k.cards()[0].paired, "startup must wait for persistence");
+    let dir = std::env::temp_dir().join(format!("keycard-default-pairing-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    k.set_store(Store::open(&dir).unwrap());
+    assert!(k.cards()[0].paired);
+    let before = admin(&k, "status", serde_json::json!({}))["freePairingSlots"].clone();
+    for _ in 0..5 {
+        k.refresh();
+        assert!(k.cards()[0].paired);
+    }
+    let got = add(&k, vec![Family::Evm], Chain::Test);
+    assert_eq!(
+        got.len(),
+        1,
+        "default pairing opens the account export channel"
+    );
+    drop(k);
+    let k = KeycardSigner::new(
+        Box::new(Simulator::new(&addr)),
+        Store::new(),
+        Box::new(Quiet),
+    );
+    k.set_store(Store::open(&dir).unwrap());
+    assert!(k.cards()[0].paired);
+    let status = admin(&k, "status", serde_json::json!({}));
+    assert_eq!(
+        status["freePairingSlots"], before,
+        "restart must reuse the saved slot"
+    );
+    admin(
+        &k,
+        "unpair",
+        serde_json::json!({"pin":PIN,"slot":status["pairingSlot"]}),
+    );
+    for _ in 0..5 {
+        k.refresh();
+        assert!(!k.cards()[0].paired, "explicit unpair must stay unpaired");
+    }
+    k.pair(PairRequest {
+        reader: None,
+        pairing_password: Secret::new("KeycardDefaultPairing"),
+    })
+    .unwrap();
+    assert!(
+        k.cards()[0].paired,
+        "manual pairing remains available after explicit unpair"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn custom_pairing_falls_back_without_retries() {
+    let Some(addr) = named("KEYCARD_SIMULATOR_V3") else {
+        return;
+    };
+    let _turn = turn_v3();
+    let k = rig(
+        &addr,
+        &Setup {
+            pairing_password: "custom pairing password".into(),
+            ..Setup::default()
+        },
+    );
+    k.set_store(Store::new());
+    assert!(!k.cards()[0].paired);
+    // Another host changes the password to the default after our failed attempt. This
+    // host must still wait for manual pairing, even though another attempt would work.
+    let other = KeycardSigner::new(
+        Box::new(Simulator::new(&addr)),
+        Store::new(),
+        Box::new(Quiet),
+    );
+    other
+        .pair(PairRequest {
+            reader: None,
+            pairing_password: Secret::new("custom pairing password"),
+        })
+        .unwrap();
+    admin(
+        &other,
+        "change_pairing_password",
+        serde_json::json!({"pin":PIN,"pairingPassword":"KeycardDefaultPairing"}),
+    );
+    drop(other);
+    for _ in 0..5 {
+        k.refresh();
+        assert!(
+            !k.cards()[0].paired,
+            "do not retry the default during polling"
+        );
+    }
+    k.pair(PairRequest {
+        reader: None,
+        pairing_password: Secret::new("KeycardDefaultPairing"),
+    })
+    .unwrap();
+    assert!(k.cards()[0].paired);
+    assert_eq!(add(&k, vec![Family::Evm], Chain::Test).len(), 1);
+}
+
+#[test]
+fn default_pairing_skips_v4_and_uninitialized_cards() {
+    let Some(addr) = simulator() else { return };
+    let _turn = turn();
+    let k = rig(&addr, &Setup::default());
+    k.set_store(Store::new());
+    assert!(!k.cards()[0].paired);
+    assert_eq!(add(&k, vec![Family::Evm], Chain::Test).len(), 1);
+    admin(
+        &k,
+        "factory_reset",
+        serde_json::json!({"confirmation":"RESET"}),
+    );
+    assert!(!k.cards()[0].card.as_ref().unwrap().initialized);
+    assert!(k.cards()[0].error.is_none());
+}
+
+#[test]
+fn v3_setup_without_custom_password_pairs_automatically() {
+    let Some(addr) = named("KEYCARD_SIMULATOR_V3") else {
+        return;
+    };
+    let _turn = turn_v3();
+    let k = rig(&addr, &Setup::default());
+    admin(
+        &k,
+        "factory_reset",
+        serde_json::json!({"confirmation":"RESET"}),
+    );
+    k.set_store(Store::new());
+    assert!(!k.cards()[0].paired);
+    admin(
+        &k,
+        "initialize",
+        serde_json::json!({"newPin":PIN,"puk":PUK}),
+    );
+    assert!(
+        k.cards()[0].paired,
+        "default setup should pair without another prompt"
+    );
+    admin(&k, "status", serde_json::json!({}));
 }

@@ -30,6 +30,16 @@ pub trait KeycardModule: Send + Sync + 'static {
     /// The readers holding a card, and what each card tells before its PIN:
     /// `{ ok, cards: [{ reader, version?, initialized?, keyUid?, secureChannel?, pinRetries?, taproot?, identity?, trustedByPerson?, paired, error?, untrusted? }] }`.
     fn cards(&self) -> String;
+    /// Physical card administration; see README for the strict action schema. Secrets are transient.
+    fn administer(&self, params_json: String) -> String;
+    /// Remembered cards with local names and their offered accounts: `{ ok, groups: [...] }`.
+    fn card_groups(&self) -> String;
+    /// Public account address previews, in input order; no card access or stored changes.
+    fn account_previews(&self, accounts_json: String) -> String;
+    /// Set a local card name (empty restores the default): `{ ok }`.
+    fn rename_card(&self, id: String, name: String) -> String;
+    /// Forget an absent card: its local name, exclusive offers, pairing and trust.
+    fn forget_saved_card(&self, id: String) -> String;
     /// Export accounts once the card's PIN opens it:
     /// `{ families, chain?, account?, label?, reader?, pin }` → `{ ok, job }`.
     fn add_accounts(&self, params_json: String) -> String;
@@ -37,6 +47,8 @@ pub trait KeycardModule: Send + Sync + 'static {
     fn add_status(&self, job: String) -> String;
     /// Stop offering an account: `{ ok, removed }`. Nothing on the card changes.
     fn remove_account(&self, id: String) -> String;
+    /// Rename a locally offered account; an empty name restores the default.
+    fn rename_account(&self, id: String, name: String) -> String;
     /// Pair a 3.x card for its secure channel: `{ reader?, pairingPassword }` → `{ ok }`.
     fn pair(&self, params_json: String) -> String;
     /// Change the PIN: `{ reader?, pin, newPin }` → `{ ok }`.
@@ -121,13 +133,89 @@ impl KeycardModule for KeycardModuleImpl {
     }
 
     fn signer_accounts(&self) -> String {
-        signer_json::signer_accounts(&mut self.keycard.clone())
+        let raw = signer_json::signer_accounts(&mut self.keycard.clone());
+        let mut reply: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => return raw,
+        };
+        let origins = self.keycard.account_origins();
+        if let Some(rows) = reply["accounts"].as_array_mut() {
+            for row in rows {
+                if let Some(origin) = row["id"].as_str().and_then(|id| origins.get(id)) {
+                    row["origin"] = origin.clone();
+                }
+            }
+        }
+        let public = self.keycard.routing_accounts();
+        if let Some(rows) = reply["accounts"].as_array_mut() {
+            for row in rows {
+                if let Some(offer) = row["id"].as_str().and_then(|id| public.get(id)) {
+                    row["keycardAccount"] = offer.clone();
+                }
+            }
+        }
+        reply["keycardRouting"] = self.keycard.routing_connections();
+        reply.to_string()
     }
 
-    fn sign(&self, mut request_json: String) -> String {
-        let reply = signer_json::sign(&mut self.keycard.clone(), &request_json);
-        request_json.zeroize();
-        reply
+    fn sign(&self, request_json: String) -> String {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Routed {
+            account: String,
+            #[serde(flatten)]
+            payload: logos_signer_interface::Payload,
+            secret: Option<logos_signer_interface::Secret>,
+            keycard_account: Option<serde_json::Value>,
+        }
+        let request_json = zeroize::Zeroizing::new(request_json);
+        let request: Routed = match serde_json::from_str(&request_json) {
+            Ok(r) => r,
+            Err(e) => return err(e),
+        };
+        drop(request_json);
+        let req = logos_signer_interface::SignRequest {
+            account: request.account,
+            payload: request.payload,
+            secret: request.secret,
+        };
+        use logos_signer_interface::Signer;
+        let result = if let Some(v) = request.keycard_account {
+            if !matches!(logos_rust_sdk::current_caller(), logos_rust_sdk::LogosCaller::Module { name, .. } if name == "signer_manager_module")
+            {
+                return err("Only the signer manager can route public Keycard accounts");
+            }
+            let account: logos_signer_interface::Account =
+                match serde_json::from_value(v["account"].clone()) {
+                    Ok(a) => a,
+                    Err(e) => return err(e),
+                };
+            let root = v["masterKeyId"].as_str().unwrap_or_default();
+            let key = v["key"].as_str().unwrap_or_default();
+            if root.len() != 64
+                || hex::decode(root).is_err()
+                || hex::decode(key)
+                    .ok()
+                    .and_then(|k| bitcoin::secp256k1::PublicKey::from_slice(&k).ok())
+                    .is_none()
+            {
+                return err("Invalid public Keycard routing metadata");
+            }
+            self.keycard.clone().sign_offered(
+                req,
+                crate::store::Offered {
+                    account,
+                    key_uid: root.into(),
+                    key: key.into(),
+                },
+            )
+        } else {
+            self.keycard.clone().sign(req)
+        };
+        match result {
+            Ok(job) => json!({"ok": true, "job": job}).to_string(),
+            Err(e) => signer_err(e),
+        }
     }
 
     fn sign_status(&self, job: String) -> String {
@@ -144,6 +232,60 @@ impl KeycardModule for KeycardModuleImpl {
 
     fn cards(&self) -> String {
         json!({ "ok": true, "cards": self.keycard.cards() }).to_string()
+    }
+
+    fn administer(&self, mut params_json: String) -> String {
+        // Factory reset is intentionally PIN-free on the applet. Keep administration behind
+        // the authenticated Keycard UI / trusted host, never arbitrary signer consumers.
+        let allowed = match logos_rust_sdk::current_caller() {
+            logos_rust_sdk::LogosCaller::Module { name, .. } => name == "keycard_ui",
+            logos_rust_sdk::LogosCaller::HostAnchor => true,
+            _ => false,
+        };
+        if !allowed {
+            params_json.zeroize();
+            return err("Only the Keycard app or trusted host can administer cards");
+        }
+        let request = match read::<crate::admin::Request>(params_json) {
+            Ok(r) => r,
+            Err(_) => return err("Invalid administration request"),
+        };
+        match self.keycard.administer(request) {
+            Ok(mut result) => {
+                result["ok"] = json!(true);
+                result.to_string()
+            }
+            Err(e) => signer_err(e),
+        }
+    }
+
+    fn account_previews(&self, accounts_json: String) -> String {
+        let accounts: Vec<logos_signer_interface::Account> =
+            match serde_json::from_str(&accounts_json) {
+                Ok(v) => v,
+                Err(_) => return err("Invalid public account list"),
+            };
+        let previews: Vec<_> = accounts
+            .iter()
+            .map(|a| crate::accounts::address_preview(a).unwrap_or_else(|e| json!({"error":e})))
+            .collect();
+        json!({"ok":true,"previews":previews}).to_string()
+    }
+
+    fn card_groups(&self) -> String {
+        json!({ "ok": true, "groups": self.keycard.card_groups() }).to_string()
+    }
+
+    fn rename_account(&self, id: String, name: String) -> String {
+        done(self.keycard.rename_account(&id, &name))
+    }
+
+    fn rename_card(&self, id: String, name: String) -> String {
+        done(self.keycard.rename_card(&id, &name))
+    }
+
+    fn forget_saved_card(&self, id: String) -> String {
+        done(self.keycard.forget_saved_card(&id))
     }
 
     fn add_accounts(&self, params_json: String) -> String {

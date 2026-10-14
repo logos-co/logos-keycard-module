@@ -6,6 +6,7 @@
 //! `KEYCARD_SIMULATOR` names one. The Logos glue is behind `logos_module`.
 
 pub mod accounts;
+pub mod admin;
 pub mod answers;
 pub mod card;
 pub mod link;
