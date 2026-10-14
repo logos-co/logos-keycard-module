@@ -121,6 +121,10 @@ For the Keycard's app:
 - `add_status`: an export's progress, `{ ok, job, state, accounts?, error? }`, the state `working`,
   `done` or `failed`.
 - `remove_account`: stop offering an account, `{ ok, removed }`.
+- `rename_account`: `(id, name)` → `{ ok }`, a local label; an empty name restores the default.
+- `card_groups`, `rename_card`, `forget_saved_card`: the seed wallets, their names and forgetting
+  one; see [Named seed wallets and physical cards](#named-seed-wallets-and-physical-cards).
+- `account_previews`: public address previews, in input order; see the end of this reference.
 - `pair`: `{ reader?, pairingPassword }` → `{ ok }`. A 3.x card only.
 - `change_pin`: `{ reader?, pin, newPin }` → `{ ok }`.
 - `unblock_pin`: `{ reader?, puk, newPin }` → `{ ok }`.
