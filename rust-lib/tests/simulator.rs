@@ -206,6 +206,8 @@ fn its_accounts_are_the_published_ones_for_the_test_phrase() {
     let fingerprint = hex::encode(Xpub::from_priv(&secp, &root).fingerprint().to_bytes());
     assert_eq!(got[1].fingerprint.as_deref(), Some(fingerprint.as_str()));
     assert_eq!(got[1].id, format!("keycard-{fingerprint}-84-0-0"));
+    // The EVM address names the same wallet as the card's Bitcoin accounts.
+    assert_eq!(got[0].fingerprint, got[1].fingerprint);
 }
 
 #[test]
