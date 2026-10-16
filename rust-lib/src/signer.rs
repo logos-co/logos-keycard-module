@@ -634,6 +634,8 @@ fn export(card: &mut Card, req: &AddRequest) -> Result<Vec<Offered>, SignerError
                 let key = card.export_public(&path).map_err(card_error)?;
                 let mut account = accounts::evm_account(&accounts::evm_address(&key), label);
                 account.path = Some(path);
+                // Names the wallet the address comes from; a card that won't export it still adds.
+                account.fingerprint = master_fingerprint(card, &mut master).ok().map(hex::encode);
                 Offered {
                     account,
                     key_uid: key_uid.clone(),
@@ -652,15 +654,7 @@ fn export(card: &mut Card, req: &AddRequest) -> Result<Vec<Offered>, SignerError
                 }
                 let path = accounts::bitcoin_path(*family, req.chain, req.account)
                     .ok_or_else(|| err(ErrorCode::Invalid, "account index"))?;
-                let fp = match master {
-                    Some(fp) => fp,
-                    None => {
-                        let fp =
-                            accounts::fingerprint(&card.export_public("m").map_err(card_error)?);
-                        master = Some(fp);
-                        fp
-                    }
-                };
+                let fp = master_fingerprint(card, &mut master)?;
                 let parent = card
                     .export_public(accounts::parent_path(&path))
                     .map_err(card_error)?;
@@ -680,6 +674,19 @@ fn export(card: &mut Card, req: &AddRequest) -> Result<Vec<Offered>, SignerError
         out.push(offered);
     }
     Ok(out)
+}
+
+/// The card's master fingerprint, exported once per add.
+fn master_fingerprint(
+    card: &mut Card,
+    cache: &mut Option<[u8; 4]>,
+) -> Result<[u8; 4], SignerError> {
+    if let Some(fp) = *cache {
+        return Ok(fp);
+    }
+    let fp = accounts::fingerprint(&card.export_public("m").map_err(card_error)?);
+    *cache = Some(fp);
+    Ok(fp)
 }
 
 fn default_label(family: Family, chain: Chain) -> String {

@@ -51,6 +51,8 @@ The Keycard's app asks for the accounts the person chooses (`add_accounts`), wit
 card exports even public keys only once its PIN is verified:
 
 - **EVM**: `m/44'/60'/0'/0/i`, where `i` is the requested account index. The id is the address, in lowercase.
+  It carries the card's master fingerprint, naming the same wallet as the card's Bitcoin accounts; an
+  account added before this, or from a card that won't export its master key, has none.
 - **Native segwit** and **taproot**: `m/84'` or `m/86'`, then `0'` for Bitcoin or `1'` for the test
   networks, then the account. The module builds the xpub from the account's public key and chain
   code, its parent's key for the parent fingerprint, and the master key for the master fingerprint.
