@@ -1,13 +1,17 @@
-//! What the module keeps in its own directory: `accounts.json`, the accounts offered, public
-//! material only; `pairings.json`, a 3.x card's pairing key by the card's instance UID, which
+//! What the module keeps in its own directory: `accounts.sealed.json`, the accounts offered, one
+//! list per seed sealed under the module's key for it from the signer manager, read only while that
+//! seed is unlocked; `pairings.json`, a 3.x card's pairing key by the card's instance UID, which
 //! only this user may read; and `trusted_cards.json`, the identity keys of the 4.0 cards Keycard
-//! didn't sign that the person chose to trust.
+//! didn't sign that the person chose to trust. Those two and `cards.json` stay plain: they are
+//! needed before the PIN.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::card::CardInfo;
 use keycard_rs::Pairing;
+use logos_signer_interface::sealed::SealedDocs;
+use logos_signer_interface::wallets::DataKey;
 use logos_signer_interface::Account;
 use serde::{Deserialize, Serialize};
 
@@ -19,11 +23,6 @@ pub struct Offered {
     pub key_uid: String,
     /// The account key, compressed, hex: what an EVM answer recovers to.
     pub key: String,
-}
-
-#[derive(Default, Serialize, Deserialize)]
-struct Accounts {
-    accounts: Vec<Offered>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -60,10 +59,16 @@ struct SavedCards {
     cards: Vec<SavedCard>,
 }
 
-#[derive(Default)]
+/// What the sealed account lists are called in their boxes.
+const ACCOUNTS: &str = "keycard_module accounts";
+
 pub struct Store {
     dir: Option<PathBuf>,
+    /// Each seed's accounts, by key UID; the readable ones are in `offered`.
+    docs: SealedDocs,
     offered: Vec<Offered>,
+    /// Added while their wallet was locked: offered, and saved, once it unlocks.
+    waiting: Vec<Offered>,
     paired: Vec<Paired>,
     trusted: Vec<String>,
     cards: Vec<SavedCard>,
@@ -95,22 +100,41 @@ fn write(path: &Path, body: &[u8]) -> std::io::Result<()> {
     std::fs::rename(tmp, path)
 }
 
+impl Default for Store {
+    fn default() -> Self {
+        Store {
+            dir: None,
+            docs: SealedDocs::in_memory(ACCOUNTS),
+            offered: Vec::new(),
+            waiting: Vec::new(),
+            paired: Vec::new(),
+            trusted: Vec::new(),
+            cards: Vec::new(),
+            wallet_names: BTreeMap::new(),
+        }
+    }
+}
+
 impl Store {
     /// In memory only, until [`Store::open`].
     pub fn new() -> Self {
         Store::default()
     }
 
-    /// Read what `dir` keeps, kept there from now on. Missing files are empty lists.
+    /// Read what `dir` keeps, kept there from now on. Missing files are empty lists. The accounts
+    /// stay sealed until each seed's key arrives ([`Store::unlock`]).
     pub fn open(dir: impl Into<PathBuf>) -> std::io::Result<Self> {
         let dir = dir.into();
-        let offered = read::<Accounts>(&dir.join("accounts.json"))?.accounts;
+        let docs = SealedDocs::load(dir.join("accounts.sealed.json"), ACCOUNTS)
+            .map_err(|e| std::io::Error::other(e.message))?;
         let paired = read::<Pairings>(&dir.join("pairings.json"))?.pairings;
         let trusted = read::<Trusted>(&dir.join("trusted_cards.json"))?.cards;
         let cards = read::<SavedCards>(&dir.join("cards.json"))?.cards;
         Ok(Store {
             dir: Some(dir.clone()),
-            offered,
+            docs,
+            offered: Vec::new(),
+            waiting: Vec::new(),
             paired,
             trusted,
             wallet_names: read(&dir.join("wallet_names.json"))?,
@@ -153,17 +177,11 @@ impl Store {
     }
 
     pub fn forget_wallet(&mut self, uid: &str) -> std::io::Result<()> {
-        let mut next = self.offered.clone();
-        next.retain(|o| o.key_uid != uid);
-        if let Some(dir) = &self.dir {
-            write(
-                &dir.join("accounts.json"),
-                &serde_json::to_vec_pretty(&Accounts {
-                    accounts: next.clone(),
-                })?,
-            )?;
-        }
-        self.offered = next;
+        self.docs
+            .remove(uid)
+            .map_err(|e| std::io::Error::other(e.message))?;
+        self.offered.retain(|o| o.key_uid != uid);
+        self.waiting.retain(|o| o.key_uid != uid);
         let mut cards = self.cards.clone();
         cards.retain_mut(|c| {
             let affected = c.key_uids.iter().any(|k| k == uid);
@@ -265,15 +283,22 @@ impl Store {
             .filter(|t| id != format!("identity:{t}"))
             .cloned()
             .collect();
-        if let Some(dir) = &self.dir {
-            write(
-                &dir.join("accounts.json"),
-                &serde_json::to_vec_pretty(&Accounts {
-                    accounts: offered.clone(),
-                })?,
-            )?;
+        let previous = std::mem::replace(&mut self.offered, offered);
+        if let Err(e) = self.save_accounts() {
+            self.offered = previous;
+            return Err(e);
         }
-        self.offered = offered;
+        // A locked wallet of this card alone goes too, though its accounts can't be read.
+        for uid in card
+            .key_uids
+            .iter()
+            .filter(|uid| !cards.iter().any(|c| c.key_uids.contains(uid)))
+        {
+            self.docs
+                .remove(uid)
+                .map_err(|e| std::io::Error::other(e.message))?;
+            self.waiting.retain(|o| &o.key_uid != uid);
+        }
         if let Some(dir) = &self.dir {
             write(
                 &dir.join("pairings.json"),
@@ -331,8 +356,12 @@ impl Store {
         }
         let previous = self.offered.clone();
         for mut o in add {
-            match self
-                .offered
+            let to = if self.is_locked(&o.key_uid) {
+                &mut self.waiting
+            } else {
+                &mut self.offered
+            };
+            match to
                 .iter_mut()
                 .find(|have| same(&have.account, &o.account.id))
             {
@@ -340,7 +369,7 @@ impl Store {
                     o.account.label = have.account.label.clone();
                     *have = o;
                 }
-                None => self.offered.push(o),
+                None => to.push(o),
             }
         }
         if let Err(e) = self.save_accounts() {
@@ -376,6 +405,7 @@ impl Store {
     pub fn remove(&mut self, id: &str) -> std::io::Result<bool> {
         let before = self.offered.len();
         self.offered.retain(|o| !same(&o.account, id));
+        self.waiting.retain(|o| !same(&o.account, id));
         self.save_accounts()?;
         Ok(self.offered.len() != before)
     }
@@ -434,12 +464,112 @@ impl Store {
         write(&dir.join("trusted_cards.json"), &body)
     }
 
-    fn save_accounts(&self) -> std::io::Result<()> {
-        let Some(dir) = &self.dir else { return Ok(()) };
-        let body = serde_json::to_vec_pretty(&Accounts {
-            accounts: self.offered.clone(),
-        })?;
-        write(&dir.join("accounts.json"), &body)
+    /// Each readable seed's accounts, sealed under its key, or kept in memory until it comes.
+    fn save_accounts(&mut self) -> std::io::Result<()> {
+        let mut by_seed: BTreeMap<String, Vec<Offered>> = BTreeMap::new();
+        for o in &self.offered {
+            by_seed
+                .entry(o.key_uid.clone())
+                .or_default()
+                .push(o.clone());
+        }
+        let gone: Vec<String> = self
+            .docs
+            .readable()
+            .into_iter()
+            .map(|(seed, _)| seed)
+            .filter(|seed| !by_seed.contains_key(seed))
+            .collect();
+        let sealing = |e: logos_signer_interface::SignerError| std::io::Error::other(e.message);
+        for seed in gone {
+            self.docs.remove(&seed).map_err(sealing)?;
+        }
+        for (seed, list) in by_seed {
+            self.docs
+                .put(&seed, serde_json::to_vec(&list)?)
+                .map_err(sealing)?;
+        }
+        Ok(())
+    }
+
+    /// Every seed whose accounts are kept here, locked or not: the keys to ask for.
+    pub fn seeds(&self) -> Vec<String> {
+        self.docs.seeds()
+    }
+
+    /// The seeds whose accounts wait for their key, each with the generation its list is sealed
+    /// under, if it is sealed yet.
+    pub fn closed(&self) -> Vec<(String, Option<u32>)> {
+        let mut out: Vec<(String, Option<u32>)> = self
+            .docs
+            .seeds()
+            .into_iter()
+            .filter(|s| !self.docs.is_open(s))
+            .map(|s| {
+                let g = self.docs.wanted(&s);
+                (s, g)
+            })
+            .collect();
+        for o in &self.waiting {
+            if !out.iter().any(|(s, _)| s == &o.key_uid) {
+                out.push((o.key_uid.clone(), None));
+            }
+        }
+        out
+    }
+
+    /// Sealed, and its key not given yet.
+    fn is_locked(&self, seed: &str) -> bool {
+        self.docs.wanted(seed).is_some()
+    }
+
+    /// A seed's key arrived: its accounts are offered again, with any added meanwhile.
+    pub fn unlock(
+        &mut self,
+        seed: &str,
+        box_key: &DataKey,
+        current: &DataKey,
+    ) -> std::io::Result<()> {
+        self.docs
+            .unlock(seed, box_key, current)
+            .map_err(|e| std::io::Error::other(e.message))?;
+        let mut list: Vec<Offered> = self
+            .docs
+            .get(seed)
+            .filter(|b| !b.is_empty())
+            .map(serde_json::from_slice)
+            .transpose()?
+            .unwrap_or_default();
+        let added: Vec<Offered> = self
+            .waiting
+            .iter()
+            .filter(|o| o.key_uid == seed)
+            .cloned()
+            .collect();
+        for mut o in added {
+            match list
+                .iter_mut()
+                .find(|have| same(&have.account, &o.account.id))
+            {
+                Some(have) => {
+                    o.account.label = have.account.label.clone();
+                    *have = o;
+                }
+                None => list.push(o),
+            }
+        }
+        self.waiting.retain(|o| o.key_uid != seed);
+        self.offered.retain(|o| o.key_uid != seed);
+        self.offered.extend(list);
+        self.save_accounts()
+    }
+
+    /// Wallets were locked: no account of a locked seed is offered or read. Accounts still
+    /// waiting for their seed's key stay.
+    pub fn lock(&mut self) {
+        self.docs.lock();
+        let readable: Vec<String> = self.docs.readable().into_iter().map(|(s, _)| s).collect();
+        self.offered.retain(|o| readable.contains(&o.key_uid));
     }
 
     fn save_pairings(&self) -> std::io::Result<()> {

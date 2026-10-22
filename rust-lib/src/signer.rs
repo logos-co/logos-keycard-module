@@ -15,6 +15,7 @@ use bitcoin::bip32::{ChildNumber, Xpub};
 use bitcoin::secp256k1::{PublicKey, Secp256k1};
 use logos_signer_interface::jobs::{JobTable, KeyJobs};
 use logos_signer_interface::unlock::{is_reserved, roster_key, unlock_key_path};
+use logos_signer_interface::wallets::DataKey;
 use logos_signer_interface::{
     verify, Account, Chain, Collects, ErrorCode, Family, HashItem, JobState, JobStatus, Payload,
     RequestKind, Scheme, Secret, SignRequest, Signature, Signer, SignerError, SignerInfo,
@@ -894,6 +895,38 @@ impl KeycardSigner {
             .accounts_changed(lock(&self.s.store).list().len());
     }
 
+    /// The wallets whose accounts wait for their key from the signer manager, each with the
+    /// generation its list is sealed under.
+    pub fn closed_seeds(&self) -> Vec<(String, Option<u32>)> {
+        lock(&self.s.store).closed()
+    }
+
+    /// A wallet's key arrived: its accounts are offered.
+    pub fn open_seed(
+        &self,
+        seed: &str,
+        box_key: &DataKey,
+        current: &DataKey,
+    ) -> std::io::Result<()> {
+        let count = {
+            let mut store = lock(&self.s.store);
+            store.unlock(seed, box_key, current)?;
+            store.list().len()
+        };
+        self.s.events.accounts_changed(count);
+        Ok(())
+    }
+
+    /// Wallets were locked: none of their accounts is offered.
+    pub fn lock_seeds(&self) {
+        let count = {
+            let mut store = lock(&self.s.store);
+            store.lock();
+            store.list().len()
+        };
+        self.s.events.accounts_changed(count);
+    }
+
     /// The readers holding a card, and what each card's SELECT told.
     pub fn cards(&self) -> Vec<Present> {
         self.s.refresh_if_idle();
@@ -1534,6 +1567,65 @@ mod grouping_tests {
         }
     }
 
+    fn key(byte: u8) -> DataKey {
+        DataKey {
+            key: Secret::new(hex::encode([byte; 32])),
+            generation: 0,
+        }
+    }
+
+    /// The store kept in `dir`, with `seed-a` unlocked.
+    fn reopened(dir: &std::path::Path) -> Store {
+        let mut store = Store::open(dir).unwrap();
+        store.unlock("seed-a", &key(1), &key(1)).unwrap();
+        store
+    }
+
+    #[test]
+    fn accounts_are_sealed_per_seed_and_offered_only_while_it_is_unlocked() {
+        let dir = std::env::temp_dir().join(format!("keycard-sealed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir).unwrap();
+        store.put(vec![offered()]).unwrap();
+        assert_eq!(store.list().len(), 1, "offered while its key is on its way");
+        assert_eq!(store.closed(), vec![("seed-a".to_string(), None)]);
+        store.unlock("seed-a", &key(1), &key(1)).unwrap();
+        let text = std::fs::read_to_string(dir.join("accounts.sealed.json")).unwrap();
+        assert!(
+            !text.contains("0x0000000000000000000000000000000000000001"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("Savings") && !text.contains("public-key"),
+            "{text}"
+        );
+
+        let mut store = Store::open(&dir).unwrap();
+        assert!(store.list().is_empty(), "locked after a restart");
+        assert_eq!(store.closed(), vec![("seed-a".to_string(), Some(0))]);
+        let mut more = offered();
+        more.account = accounts::evm_account("0x0000000000000000000000000000000000000002", None);
+        store.put(vec![more]).unwrap();
+        assert!(
+            store.list().is_empty(),
+            "an account added while locked waits"
+        );
+        assert!(
+            store.unlock("seed-a", &key(2), &key(2)).is_err(),
+            "another key"
+        );
+        store.unlock("seed-a", &key(1), &key(1)).unwrap();
+        assert_eq!(
+            store.list().len(),
+            2,
+            "and joins its wallet's list when it unlocks"
+        );
+        store.lock();
+        assert!(store.list().is_empty());
+        assert_eq!(reopened(&dir).list().len(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn offered() -> Offered {
         Offered {
             account: accounts::evm_account(
@@ -1651,12 +1743,13 @@ mod grouping_tests {
             ])
             .unwrap();
         store.put(vec![offered()]).unwrap();
+        store.unlock("seed-a", &key(1), &key(1)).unwrap();
         store.rename_card("instance:a", "Daily").unwrap();
         let signer = KeycardSigner::new(Box::new(NoReaders), store, Box::new(Quiet));
         signer.forget_saved_card("instance:a").unwrap();
         signer.forget_saved_card("identity:c").unwrap();
         let store = Store::open(&dir).unwrap();
-        assert!(store.list().is_empty());
+        assert!(store.closed().is_empty(), "its sealed list went too");
         assert_eq!(
             store
                 .cards()
@@ -1772,17 +1865,18 @@ mod grouping_tests {
         let mut expected = offered();
         let id = expected.account.id.clone();
         store.put(vec![expected.clone()]).unwrap();
+        store.unlock("seed-a", &key(1), &key(1)).unwrap();
         store
             .rename_account(&id.to_uppercase(), "  Travel ETH  ")
             .unwrap();
         expected.account.label = Some("Travel ETH".into());
-        assert_eq!(Store::open(&dir).unwrap().find(&id), Some(&expected));
+        assert_eq!(reopened(&dir).find(&id), Some(&expected));
         assert!(store.rename_account("unknown", "Other").is_err());
         assert!(store.rename_account(&id, &"x".repeat(81)).is_err());
         assert!(store.rename_account(&id, "bad\nname").is_err());
         store.rename_account(&id, " ").unwrap();
         expected.account.label = None;
-        assert_eq!(Store::open(&dir).unwrap().find(&id), Some(&expected));
+        assert_eq!(reopened(&dir).find(&id), Some(&expected));
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::write(&dir, "not a directory").unwrap();
         assert!(store.rename_account(&id, "Unsaved").is_err());

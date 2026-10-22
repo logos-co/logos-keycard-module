@@ -58,8 +58,13 @@ card exports even public keys only once its PIN is verified:
   code, its parent's key for the parent fingerprint, and the master key for the master fingerprint.
   The id is `keycard-<fingerprint>-<purpose>-<coin>-<account>`. Taproot needs applet 4.0.
 
-They are kept in `accounts.json` in the module's own directory, each with the card's key UID, the
-SHA-256 of its master public key, which SELECT tells before any PIN. An account is `available` while
+They are kept in `accounts.sealed.json` in the module's own directory, each with the card's key UID,
+the SHA-256 of its master public key, which SELECT tells before any PIN. Each key UID's list is sealed
+under the module's key for that seed, `data_key({ seed: <key UID>, scope: "accounts" })` from the signer
+manager ([logos.wallets/1](https://github.com/logos-co/logos-signer-interface/blob/main/docs/wallets.md)),
+asked for when `wallets_changed` says a wallet unlocked. While a seed is locked none of its accounts
+is offered; one added meanwhile waits in memory and joins the list when it unlocks. The pairings,
+trusted identities and remembered cards stay plain: they are needed before the PIN. An account is `available` while
 a card with that key UID is in a reader. The module looks at the readers every second and a half,
 reads a card when it is inserted and again after each of its own sessions, which can change the
 card's pairing or its PIN tries, and announces a change with `signer_changed` and

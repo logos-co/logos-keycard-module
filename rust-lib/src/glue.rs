@@ -16,6 +16,7 @@ use crate::signer::{
     AddRequest, ChangePinRequest, Events, KeycardSigner, PairRequest, TrustRequest, UnblockRequest,
 };
 use crate::store::Store;
+use logos_signer_interface::wallets::{read_data_key, DataKey, DataKeyRequest};
 
 pub trait KeycardModule: Send + Sync + 'static {
     // ── logos.signer/1 ──────────────────────────────────────────────────
@@ -115,6 +116,71 @@ impl Events for Emit {
             "disconnected"
         });
     }
+}
+
+/// A wallet's accounts open with this module's key for them, which the signer manager gives once
+/// the person unlocks the wallet in the Signer app, and close when it locks. Asked from threads
+/// of their own, never while answering the manager, which would wait on itself.
+fn watch_wallets(keycard: KeycardSigner) {
+    let mut client = wallets::WalletsClient::bind(WALLETS);
+    let changed = client.on_wallets_changed();
+    let locked = client.on_wallets_locked();
+    let k = keycard.clone();
+    std::thread::spawn(move || {
+        open_wallets(&k);
+        if let Ok(sub) = changed {
+            for _ in sub {
+                open_wallets(&k);
+            }
+        }
+    });
+    if let Ok(sub) = locked {
+        std::thread::spawn(move || {
+            for _ in sub {
+                keycard.lock_seeds();
+                // Only some may have locked.
+                open_wallets(&keycard);
+            }
+        });
+    }
+}
+
+/// Every closed wallet's key; a locked one answers `locked` and stays closed.
+fn open_wallets(keycard: &KeycardSigner) {
+    for (seed, sealed_under) in keycard.closed_seeds() {
+        let Some(current) = data_key(&seed, None) else {
+            continue;
+        };
+        let box_key = match sealed_under {
+            Some(g) if g != current.generation => match data_key(&seed, Some(g)) {
+                Some(k) => k,
+                None => continue,
+            },
+            _ => current.clone(),
+        };
+        if let Err(e) = keycard.open_seed(&seed, &box_key, &current) {
+            eprintln!("keycard_module: a wallet's accounts didn't open: {e}");
+        }
+    }
+}
+
+/// The key for a wallet's account list, named by the card's key UID, as the manager knows it.
+fn data_key(seed: &str, generation: Option<u32>) -> Option<DataKey> {
+    let body = serde_json::to_string(&DataKeyRequest {
+        seed: seed.to_string(),
+        scope: "accounts".into(),
+        generation,
+    })
+    .ok()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    wallets::WalletsClient::bind(WALLETS).data_key_async_with_timeout(
+        &body,
+        Duration::from_secs(10),
+        move |r| {
+            let _ = tx.send(r);
+        },
+    );
+    read_data_key(&rx.recv().ok()?.ok()?).ok()
 }
 
 struct KeycardModuleImpl {
@@ -415,7 +481,10 @@ impl KeycardModule for KeycardModuleImpl {
     fn on_context_ready(&self, ctx: &RustModuleContext) {
         // The accounts offered and the pairings live in the module's own directory.
         match Store::open(&ctx.instance_persistence_path) {
-            Ok(store) => self.keycard.set_store(store),
+            Ok(store) => {
+                self.keycard.set_store(store);
+                watch_wallets(self.keycard.clone());
+            }
             Err(e) => eprintln!("keycard_module: {}: {e}", ctx.instance_persistence_path),
         }
     }
