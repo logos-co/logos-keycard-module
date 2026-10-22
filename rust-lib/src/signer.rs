@@ -152,6 +152,8 @@ pub struct CardGroup {
     pub accounts: Vec<Account>,
     pub connections: Vec<serde_json::Value>,
     pub aliases: Vec<String>,
+    /// Its accounts are sealed until the person unlocks the wallet in the Signer app.
+    pub locked: bool,
 }
 
 struct Shared {
@@ -987,6 +989,7 @@ impl KeycardSigner {
                     accounts: vec![],
                     connections: vec![],
                     aliases: vec![],
+                    locked: !uid.is_empty() && store.is_locked(&uid),
                 });
                 g.connected |= connected;
                 if !saved.name.is_empty() && !g.aliases.contains(&saved.name) {
@@ -1012,6 +1015,7 @@ impl KeycardSigner {
                 accounts: vec![],
                 connections: vec![],
                 aliases: vec![],
+                locked: false,
             });
             g.connected |= available;
             g.accounts.push(Account {
@@ -1660,6 +1664,28 @@ mod grouping_tests {
         assert!(!groups[0].legacy);
         assert!(!groups[0].connected);
         assert_eq!(groups[0].accounts.len(), 1);
+    }
+
+    #[test]
+    fn a_card_whose_wallet_is_locked_says_so_and_offers_nothing() {
+        let dir = std::env::temp_dir().join(format!("keycard-locked-group-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir).unwrap();
+        store.remember_cards(&[card("a", "seed-a", false)]).unwrap();
+        store.put(vec![offered()]).unwrap();
+        store.unlock("seed-a", &key(1), &key(1)).unwrap();
+        let signer = KeycardSigner::new(
+            Box::new(NoReaders),
+            Store::open(&dir).unwrap(),
+            Box::new(Quiet),
+        );
+        let groups = signer.card_groups();
+        assert_eq!((groups.len(), groups[0].locked), (1, true));
+        assert!(groups[0].accounts.is_empty());
+        signer.open_seed("seed-a", &key(1), &key(1)).unwrap();
+        let groups = signer.card_groups();
+        assert_eq!((groups[0].locked, groups[0].accounts.len()), (false, 1));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

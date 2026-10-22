@@ -518,8 +518,8 @@ impl Store {
         out
     }
 
-    /// Sealed, and its key not given yet.
-    fn is_locked(&self, seed: &str) -> bool {
+    /// Sealed, and its key not given yet: its wallet is locked in the Signer app.
+    pub fn is_locked(&self, seed: &str) -> bool {
         self.docs.wanted(seed).is_some()
     }
 
