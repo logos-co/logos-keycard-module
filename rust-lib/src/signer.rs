@@ -13,11 +13,12 @@ use std::time::Duration;
 
 use bitcoin::bip32::{ChildNumber, Xpub};
 use bitcoin::secp256k1::{PublicKey, Secp256k1};
-use logos_signer_interface::jobs::JobTable;
+use logos_signer_interface::jobs::{JobTable, KeyJobs};
+use logos_signer_interface::unlock::{is_reserved, roster_key, unlock_key_path};
 use logos_signer_interface::{
     verify, Account, Chain, Collects, ErrorCode, Family, HashItem, JobState, JobStatus, Payload,
     RequestKind, Scheme, Secret, SignRequest, Signature, Signer, SignerError, SignerInfo,
-    INTERFACE,
+    UnlockKey, UnlockKeyRequest, INTERFACE,
 };
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +36,9 @@ pub trait Events: Send + Sync {
     fn sign_progress(&self, job: &str, state: JobState);
     fn accounts_changed(&self, count: usize);
     fn device_changed(&self, connected: bool);
+    /// Accounts of a seed were added, with its unlock key at index 0 when the card gave it: the
+    /// glue registers the seed with the signer manager.
+    fn seed_added(&self, _seed: &str, _unlock_key: Option<[u8; 33]>, _name: &str) {}
 }
 
 /// Announces nothing, for tests.
@@ -153,6 +157,8 @@ struct Shared {
     readers: Box<dyn Readers>,
     store: Mutex<Store>,
     jobs: Mutex<JobTable>,
+    /// Unlock-key jobs: read once, by the manager only, and announced nowhere.
+    keys: Mutex<KeyJobs>,
     adds: Mutex<HashMap<String, Added>>,
     cards: Mutex<Vec<Present>>,
     scan: Mutex<()>,
@@ -258,6 +264,11 @@ fn plan(offered: &Offered, items: &[HashItem]) -> Result<Vec<Step>, SignerError>
                     .path
                     .clone()
                     .ok_or_else(|| invalid(format!("item {i}: a Bitcoin item names its path")))?;
+                if is_reserved(&path) {
+                    return Err(invalid(format!(
+                        "item {i}: nothing signs under the unlock keys' purpose"
+                    )));
+                }
                 verify::relative(base, &path)?;
                 let tail: Vec<ChildNumber> = parse_path(&path)
                     .zip(parse_path(base))
@@ -614,8 +625,14 @@ impl Shared {
     }
 }
 
+/// The accounts exported, and the seed's unlock key at index 0, read in the same PIN session.
+struct Exported {
+    offered: Vec<Offered>,
+    unlock_key: Option<[u8; 33]>,
+}
+
 /// Export the requested accounts from an opened card.
-fn export(card: &mut Card, req: &AddRequest) -> Result<Vec<Offered>, SignerError> {
+fn export(card: &mut Card, req: &AddRequest) -> Result<Exported, SignerError> {
     let info = card.info();
     let key_uid = info
         .key_uid
@@ -673,7 +690,15 @@ fn export(card: &mut Card, req: &AddRequest) -> Result<Vec<Offered>, SignerError
         };
         out.push(offered);
     }
-    Ok(out)
+    // A card that won't export it still adds: its wallet then unlocks by a password.
+    let unlock_key = unlock_key_path(0)
+        .ok()
+        .and_then(|path| card.export_public(&path).ok())
+        .map(|k| k.serialize());
+    Ok(Exported {
+        offered: out,
+        unlock_key,
+    })
 }
 
 /// The card's master fingerprint, exported once per add.
@@ -719,6 +744,19 @@ impl KeycardSigner {
                 ErrorCode::Invalid,
                 "Routed account does not match the request",
             ));
+        }
+        if let (Some(brought), Some(listed)) =
+            (request.xpub.as_deref(), offered.account.xpub.as_deref())
+        {
+            let (family, chain) = (offered.account.family, offered.account.chain);
+            let same =
+                roster_key(family, chain, brought).ok() == roster_key(family, chain, listed).ok();
+            if !same {
+                return Err(err(
+                    ErrorCode::Invalid,
+                    "the request's xpub is not this account's",
+                ));
+            }
         }
         let Payload::Hash { items } = request.payload else {
             return Err(err(
@@ -809,6 +847,7 @@ impl KeycardSigner {
             readers,
             store: Mutex::new(store),
             jobs: Mutex::new(JobTable::new()),
+            keys: Mutex::new(KeyJobs::new()),
             adds: Mutex::new(HashMap::new()),
             cards: Mutex::new(Vec::new()),
             scan: Mutex::new(()),
@@ -1059,11 +1098,28 @@ impl KeycardSigner {
             req.card_id.clone(),
             move |card| export(card, &req),
             move |s, outcome| {
-                let outcome = outcome.and_then(|offered| {
-                    let accounts = offered.iter().map(|o| o.account.clone()).collect();
+                let outcome = outcome.and_then(|exported| {
+                    let Exported {
+                        offered,
+                        unlock_key,
+                    } = exported;
+                    let accounts = offered
+                        .iter()
+                        .map(|o| Account {
+                            seed: Some(o.key_uid.clone()),
+                            ..o.account.clone()
+                        })
+                        .collect();
+                    let seed = offered.first().map(|o| o.key_uid.clone());
                     lock(&s.store)
                         .put(offered)
                         .map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
+                    if let Some(seed) = seed {
+                        let name = Some(lock(&s.store).wallet_name(&seed))
+                            .filter(|n| !n.is_empty())
+                            .unwrap_or_else(|| "Keycard".into());
+                        s.events.seed_added(&seed, unlock_key, &name);
+                    }
                     Ok(accounts)
                 });
                 let added = match outcome {
@@ -1333,6 +1389,7 @@ impl Signer for KeycardSigner {
             request_kinds: vec![RequestKind::Hash],
             shows_request: false,
             collects: Collects::Pin,
+            unlock_key: true,
         }
     }
 
@@ -1346,6 +1403,7 @@ impl Signer for KeycardSigner {
             .iter()
             .map(|o| Account {
                 available: inserted.contains(&o.key_uid),
+                seed: Some(o.key_uid.clone()),
                 ..o.account.clone()
             })
             .collect())
@@ -1375,6 +1433,69 @@ impl Signer for KeycardSigner {
     /// The card signs in a moment; a cancelled job's signatures are dropped.
     fn cancel(&mut self, job: &str) -> logos_signer_interface::Result<()> {
         lock(&self.s.jobs).cancel(job)
+    }
+
+    /// A seed's unlock key, in a PIN session, once the card proves it holds that seed.
+    fn unlock_key(&mut self, request: UnlockKeyRequest) -> logos_signer_interface::Result<String> {
+        let path = unlock_key_path(request.index)?;
+        let uid = request.seed.trim().to_string();
+        if !lock(&self.s.store).list().iter().any(|o| o.key_uid == uid) {
+            return Err(err(
+                ErrorCode::WrongSeed,
+                "no Keycard account comes from this seed",
+            ));
+        }
+        let pin = request
+            .secret
+            .ok_or_else(|| err(ErrorCode::Locked, "enter the Keycard's PIN"))?;
+        digits(&pin, 6, "PIN")?;
+        self.s.refresh_if_idle();
+        let reader = self.s.reader_holding(&uid, Family::Evm)?;
+        let hold = self.s.hold()?;
+        let (job_tx, job_rx) = mpsc::channel::<String>();
+        self.s.with_pin(
+            hold,
+            reader,
+            pin,
+            Some(format!("seed:{uid}")),
+            move |card| {
+                let job = job_rx.recv().ok()?;
+                let outcome = card
+                    .export_public("m")
+                    .map_err(card_error)
+                    .and_then(|root| {
+                        use bitcoin::hashes::{sha256, Hash};
+                        if sha256::Hash::hash(&root.serialize_uncompressed()).to_string() != uid {
+                            return Err(err(ErrorCode::WrongSeed, "this card holds another seed"));
+                        }
+                        let key = card.export_public(&path).map_err(card_error)?;
+                        Ok(UnlockKey {
+                            key: Secret::new(hex::encode(key.serialize())),
+                        })
+                    });
+                Some((job, outcome))
+            },
+            |s, done| {
+                if let Some((job, outcome)) = done {
+                    let _ = lock(&s.keys).finish(&job, outcome);
+                }
+            },
+        )?;
+        let job = lock(&self.s.keys).start(JobState::Working);
+        let _ = job_tx.send(job.clone());
+        Ok(job)
+    }
+
+    fn unlock_key_status(&mut self, job: &str) -> logos_signer_interface::Result<JobStatus> {
+        lock(&self.s.keys).status(job)
+    }
+
+    fn unlock_key_result(&mut self, job: &str) -> logos_signer_interface::Result<UnlockKey> {
+        lock(&self.s.keys).take(job)
+    }
+
+    fn cancel_unlock_key(&mut self, job: &str) -> logos_signer_interface::Result<()> {
+        lock(&self.s.keys).cancel(job)
     }
 }
 

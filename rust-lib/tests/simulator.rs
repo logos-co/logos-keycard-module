@@ -21,7 +21,7 @@ use keycard_module::store::Store;
 use logos_signer_interface::conformance::{self, Fixture};
 use logos_signer_interface::{
     verify, Account, Chain, ErrorCode, Family, HashItem, JobState, Payload, Scheme, Secret,
-    SignRequest, Signer,
+    SignRequest, Signer, UnlockKeyRequest,
 };
 
 /// BIP86's test vectors, from bitcoin/bips (fetched 2026-10-10), for the "abandon … about"
@@ -132,6 +132,7 @@ fn request(account: &Account, pin: Option<&str>) -> SignRequest {
             items: conformance::items_for(account),
         },
         secret: pin.map(Secret::new),
+        xpub: None,
     }
 }
 
@@ -338,6 +339,7 @@ fn a_bitcoin_item_signs_only_below_its_account() {
                 }],
             },
             secret: Some(Secret::new(PIN)),
+            xpub: None,
         };
         assert_eq!(k.sign(r).unwrap_err().code, ErrorCode::Invalid, "{path}");
     }
@@ -357,6 +359,7 @@ fn a_bitcoin_item_signs_only_below_its_account() {
                 items: items.clone(),
             },
             secret: Some(Secret::new(PIN)),
+            xpub: None,
         })
         .unwrap();
     assert_eq!(settle(&mut k, &job), JobState::Done);
@@ -998,4 +1001,67 @@ fn v3_setup_without_custom_password_pairs_automatically() {
         "default setup should pair without another prompt"
     );
     admin(&k, "status", serde_json::json!({}));
+}
+
+#[test]
+fn the_card_gives_its_phrases_unlock_key_after_its_pin_and_only_for_its_seed() {
+    let Some(addr) = simulator() else { return };
+    let _turn = turn();
+    let mut k = rig(&addr, &Setup::default());
+    let added = add(&k, vec![Family::Evm], Chain::Test);
+    let seed = added[0].seed.clone().expect("the account names its seed");
+    assert_eq!(
+        k.accounts().unwrap()[0].seed.as_deref(),
+        Some(seed.as_str())
+    );
+
+    // The phrase's own key at m/1280263247'/n', as any other holder of it gives.
+    let secp = Secp256k1::new();
+    let phrase = bip39::Mnemonic::parse(sim::TEST_PHRASE).unwrap();
+    let master = Xpriv::new_master(bitcoin::NetworkKind::Test, &phrase.to_seed("")).unwrap();
+    let want = |n: u32| {
+        let path = DerivationPath::from_str(&format!("m/1280263247'/{n}'")).unwrap();
+        hex::encode(
+            Xpub::from_priv(&secp, &master.derive_priv(&secp, &path).unwrap())
+                .public_key
+                .serialize(),
+        )
+    };
+    let key = |k: &mut KeycardSigner,
+               seed: &str,
+               n: u32,
+               pin: Option<&str>|
+     -> Result<String, ErrorCode> {
+        let job = k
+            .unlock_key(UnlockKeyRequest {
+                seed: seed.into(),
+                index: n,
+                secret: pin.map(Secret::new),
+            })
+            .map_err(|e| e.code)?;
+        for _ in 0..100 {
+            let st = k.unlock_key_status(&job).unwrap();
+            if st.state.is_final() {
+                return match st.state {
+                    JobState::Done => {
+                        Ok(k.unlock_key_result(&job).unwrap().key.expose().to_string())
+                    }
+                    _ => Err(st.error.map(|e| e.code).unwrap_or(ErrorCode::Internal)),
+                };
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("the unlock key never came");
+    };
+    assert_eq!(key(&mut k, &seed, 0, Some(PIN)).unwrap(), want(0));
+    assert_eq!(key(&mut k, &seed, 1, Some(PIN)).unwrap(), want(1));
+    assert_eq!(
+        key(&mut k, &seed, 0, Some("654321")).unwrap_err(),
+        ErrorCode::WrongSecret
+    );
+    assert_eq!(key(&mut k, &seed, 0, None).unwrap_err(), ErrorCode::Locked);
+    assert_eq!(
+        key(&mut k, &"00".repeat(32), 0, Some(PIN)).unwrap_err(),
+        ErrorCode::WrongSeed
+    );
 }

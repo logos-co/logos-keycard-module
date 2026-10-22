@@ -70,6 +70,23 @@ another chain code, so every derived key differs while the key UID stays the sam
 at INIT, the card takes the PUK's first six digits. An account offered under one PIN and signed under
 the other fails with `unavailable`, naming this, since the card's key is not the account's.
 
+## The seed's unlock key
+
+Every account names its `seed`: the card's key UID. The signer manager unlocks that seed's data, in
+every app, with the public key at `m/1280263247'/n'`, which every holder of the seed gives.
+
+- **At add**, in the same PIN session, the card exports the key at `m/1280263247'/0'`, and the module
+  registers the seed with the manager: `enroll_seed({ seed, kind: "keycard", unlockKey, name })`
+  through `logos.wallets/1` (`wallets.lidl`), bound to `signer_manager_module` at runtime and asked
+  without waiting. A card that won't export it still adds; its wallet then unlocks by a password.
+- **`unlock_key`** (`{ seed, index, secret }`, the secret being the PIN, the manager alone) opens the
+  card in the reader holding that key UID, verifies the PIN, checks that the master public key is
+  that seed's, and exports the key at `m/1280263247'/<index>'`. It returns a job once the PIN is
+  checked; `unlock_key_result` gives the key once.
+  - A seed no account comes from is `wrong_seed`, and so is a card that holds another one.
+  - No PIN is `locked`, and a wrong one `wrong_secret`.
+  - Nothing signs under that purpose: an item under it is refused.
+
 ## Signing
 
 `signer_info` says a Keycard takes `hash` requests only, shows nothing, and collects a `pin`.
@@ -89,6 +106,9 @@ counts it as a wrong try.
   it to its key. The answer names the tweaked output key, which the module works out itself: the
   card names the untweaked one.
 
+A Bitcoin request may bring the account's xpub, from the wallet that has it open; one that isn't
+the account's is refused.
+
 Each key the card says it signed with must be the one the module derived, and each signature is
 checked as the manager checks it, with `verify::check`, before the job settles. A card with another
 key, or opened by its alternate PIN, signs nothing for the account.
@@ -103,9 +123,12 @@ a PIN, PUK or pairing password is wiped once read.
 
 The signer interface's methods, as `docs/interface.md` there specifies them:
 
-- `signer_info`: the interface, `keycard`, the three families, `hash`, `showsRequest: false`, and
-  `collects: pin`.
-- `signer_accounts`: the offered accounts, each `available` while its card is in a reader.
+- `signer_info`: the interface, `keycard`, the three families, `hash`, `showsRequest: false`,
+  `collects: pin` and `unlockKey: true`.
+- `signer_accounts`: the offered accounts, each `available` while its card is in a reader, and each
+  naming its `seed`.
+- `unlock_key`, `unlock_key_status`, `unlock_key_result`, `cancel_unlock_key`: the signer manager
+  alone; see [The seed's unlock key](#the-seeds-unlock-key).
 - `sign`: `{ account, kind: "hash", items, secret }`, the secret being the PIN. Returns a job once the
   PIN is verified.
 - `sign_status`, `sign_result`, `cancel_sign`.
