@@ -146,6 +146,8 @@ fn its_accounts_are_the_published_ones_for_the_test_phrase() {
         vec![Family::Evm, Family::Bitcoin, Family::BitcoinTaproot],
         Chain::Main,
     );
+    // Unnamed, an account keeps no name: apps show its kind and address.
+    assert!(got.iter().all(|a| a.label.is_none()), "{got:?}");
     let secp = Secp256k1::new();
     let root = Xpriv::from_str(BIP86_ROOTPRIV).unwrap();
     let evm = root

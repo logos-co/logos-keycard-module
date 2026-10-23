@@ -644,10 +644,8 @@ fn export(card: &mut Card, req: &AddRequest) -> Result<Exported, SignerError> {
     let mut master = None;
     let mut out = Vec::new();
     for family in &req.families {
-        let label = req
-            .label
-            .clone()
-            .or_else(|| Some(default_label(*family, req.chain)));
+        // Its own name only: an unnamed account shows as its kind and address, not a stored default.
+        let label = req.label.clone().filter(|l| !l.trim().is_empty());
         let offered = match family {
             Family::Evm => {
                 let path = format!("m/44'/60'/0'/0/{}", req.account);
@@ -715,15 +713,6 @@ fn master_fingerprint(
     let fp = accounts::fingerprint(&card.export_public("m").map_err(card_error)?);
     *cache = Some(fp);
     Ok(fp)
-}
-
-fn default_label(family: Family, chain: Chain) -> String {
-    let test = if chain == Chain::Test { " (test)" } else { "" };
-    match family {
-        Family::Evm => "Keycard EVM".into(),
-        Family::Bitcoin => format!("Keycard native segwit{test}"),
-        Family::BitcoinTaproot => format!("Keycard taproot{test}"),
-    }
 }
 
 /// The module's state, shared with the sessions it runs.
