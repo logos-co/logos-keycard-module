@@ -1465,7 +1465,12 @@ impl Signer for KeycardSigner {
     fn unlock_key(&mut self, request: UnlockKeyRequest) -> logos_signer_interface::Result<String> {
         let path = unlock_key_path(request.index)?;
         let uid = request.seed.trim().to_string();
-        if !lock(&self.s.store).list().iter().any(|o| o.key_uid == uid) {
+        // A locked wallet lists no account, and this is how it unlocks: its seed is known all the same.
+        let known = {
+            let st = lock(&self.s.store);
+            st.seeds().contains(&uid) || st.list().iter().any(|o| o.key_uid == uid)
+        };
+        if !known {
             return Err(err(
                 ErrorCode::WrongSeed,
                 "no Keycard account comes from this seed",
@@ -1572,6 +1577,33 @@ mod grouping_tests {
         let mut store = Store::open(dir).unwrap();
         store.unlock("seed-a", &key(1), &key(1)).unwrap();
         store
+    }
+
+    #[test]
+    fn a_locked_wallet_still_asks_its_card_for_the_unlock_key() {
+        let dir = std::env::temp_dir().join(format!("keycard-locked-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir).unwrap();
+        store.put(vec![offered()]).unwrap();
+        store.unlock("seed-a", &key(1), &key(1)).unwrap();
+        // After a restart the wallet is locked: no account listed, its seed known.
+        let store = Store::open(&dir).unwrap();
+        assert!(store.list().is_empty());
+        let mut signer = KeycardSigner::new(Box::new(NoReaders), store, Box::new(Quiet));
+        let ask = |seed: &str| UnlockKeyRequest {
+            seed: seed.into(),
+            index: 0,
+            secret: Some(Secret::new("123456")),
+        };
+        let e = signer.unlock_key(ask("seed-a")).unwrap_err();
+        assert_eq!(
+            e.code,
+            ErrorCode::Unavailable,
+            "it asks for the card: {e:?}"
+        );
+        let e = signer.unlock_key(ask("seed-b")).unwrap_err();
+        assert_eq!(e.code, ErrorCode::WrongSeed, "{e:?}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
