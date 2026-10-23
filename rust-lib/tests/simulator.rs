@@ -14,7 +14,8 @@ use bitcoin::secp256k1::Secp256k1;
 use keycard_module::accounts;
 use keycard_module::link::Simulator;
 use keycard_module::signer::{
-    AddRequest, ChangePinRequest, KeycardSigner, PairRequest, Quiet, TrustRequest, UnblockRequest,
+    AddEntry, AddRequest, ChangePinRequest, KeycardSigner, PairRequest, Quiet, TrustRequest,
+    UnblockRequest,
 };
 use keycard_module::sim::{self, Setup};
 use keycard_module::store::Store;
@@ -104,9 +105,21 @@ fn add_request(families: Vec<Family>, chain: Chain) -> AddRequest {
         chain,
         account: 0,
         label: None,
+        entries: Vec::new(),
+        preview: false,
+        from_preview: false,
         reader: None,
         card_id: None,
         pin: Secret::new(PIN),
+    }
+}
+
+fn entry(family: Family, account: u32, chain: Option<Chain>, label: Option<&str>) -> AddEntry {
+    AddEntry {
+        family,
+        account,
+        chain,
+        label: label.map(Into::into),
     }
 }
 
@@ -524,6 +537,82 @@ fn additional_evm_accounts_use_the_requested_path_and_reject_a_swapped_card() {
     for signature in &signatures {
         verify::check(&second, &items[signature.item], signature).unwrap();
     }
+}
+
+#[test]
+fn accounts_a_preview_showed_are_kept_from_it_without_the_card() {
+    let Some(addr) = simulator() else { return };
+    let _turn = turn();
+    let mut k = rig(&addr, &Setup::default());
+    let mut req = add_request(Vec::new(), Chain::Main);
+    req.entries = (0..5).map(|i| entry(Family::Evm, i, None, None)).collect();
+    req.preview = true;
+    let page = exported(&k, req).unwrap();
+    let mut req = add_request(Vec::new(), Chain::Main);
+    req.entries = vec![entry(Family::Bitcoin, 2, None, None)];
+    req.preview = true;
+    let btc = exported(&k, req).unwrap();
+
+    // No PIN: the picks come from the two previews, each with its own name or none.
+    let mut keep = add_request(Vec::new(), Chain::Main);
+    keep.pin = Secret::default();
+    keep.from_preview = true;
+    keep.entries = vec![
+        entry(Family::Evm, 4, None, Some("Rent")),
+        entry(Family::Bitcoin, 2, None, None),
+    ];
+    let kept = exported(&k, keep.clone()).unwrap();
+    assert_eq!(kept[0].id, page[4].id);
+    assert_eq!(kept[0].label.as_deref(), Some("Rent"));
+    assert_eq!(kept[1].id, btc[0].id);
+    assert_eq!(kept[1].label, None);
+    assert_eq!(k.accounts().unwrap().len(), 2);
+
+    // Keeping forgets the previews, and an account no preview showed is refused.
+    assert!(k.add_accounts(keep).is_err(), "kept twice");
+    let mut unseen = add_request(Vec::new(), Chain::Main);
+    unseen.from_preview = true;
+    unseen.entries = vec![entry(Family::Evm, 9, None, None)];
+    assert!(k.add_accounts(unseen).is_err(), "never previewed");
+}
+
+#[test]
+fn a_preview_keeps_nothing_and_entries_add_each_account_with_its_own_name() {
+    let Some(addr) = simulator() else { return };
+    let _turn = turn();
+    let mut k = rig(&addr, &Setup::default());
+    let mut req = add_request(Vec::new(), Chain::Main);
+    req.entries = vec![
+        entry(Family::Evm, 0, None, None),
+        entry(Family::Evm, 3, None, Some("Savings")),
+        entry(Family::Bitcoin, 1, Some(Chain::Test), None),
+    ];
+    req.preview = true;
+    let shown = exported(&k, req.clone()).unwrap();
+    assert_eq!(shown.len(), 3);
+    assert_eq!(shown[1].path.as_deref(), Some("m/44'/60'/0'/0/3"));
+    assert_eq!(shown[2].path.as_deref(), Some("m/84'/1'/1'"));
+    assert!(k.accounts().unwrap().is_empty(), "a preview keeps nothing");
+
+    req.preview = false;
+    let added = exported(&k, req.clone()).unwrap();
+    assert_eq!(
+        added.iter().map(|a| a.id.clone()).collect::<Vec<_>>(),
+        shown.iter().map(|a| a.id.clone()).collect::<Vec<_>>(),
+        "the add keeps the accounts the preview showed"
+    );
+    assert_eq!(added[1].label.as_deref(), Some("Savings"));
+    assert_eq!(added[0].label, None);
+    assert_eq!(k.accounts().unwrap().len(), 3);
+
+    req.families = vec![Family::Evm];
+    assert!(
+        k.add_accounts(req.clone()).is_err(),
+        "families and entries both"
+    );
+    req.families.clear();
+    req.entries = (0..21).map(|i| entry(Family::Evm, i, None, None)).collect();
+    assert!(k.add_accounts(req).is_err(), "more than twenty");
 }
 
 #[test]

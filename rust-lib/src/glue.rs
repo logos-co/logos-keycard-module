@@ -49,7 +49,7 @@ pub trait KeycardModule: Send + Sync + 'static {
     /// Forget an absent card: its local name, exclusive offers, pairing and trust.
     fn forget_saved_card(&self, id: String) -> String;
     /// Export accounts once the card's PIN opens it:
-    /// `{ families, chain?, account?, label?, reader?, pin }` → `{ ok, job }`.
+    /// `{ families | entries, chain?, account?, label?, reader?, pin, preview?, fromPreview? }` → `{ ok, job }`.
     fn add_accounts(&self, params_json: String) -> String;
     /// An export's progress: `{ ok, job, state, accounts?, error? }`.
     fn add_status(&self, job: String) -> String;

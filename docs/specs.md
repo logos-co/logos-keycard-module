@@ -149,6 +149,11 @@ For the Keycard's app:
 - `add_accounts`: `{ families, chain?, account?, label?, reader?, cardId?, pin }` → `{ ok, job }`, once the PIN
   is verified. `chain` is `main` or `test`, `test` by default; `reader` is needed only when more
   than one holds a Keycard. `cardId` optionally pins the physical identity and is checked before PIN verification.
+  For several accounts at once, `entries: [{ family, account, chain?, label? }]` (up to 20) replaces
+  `families`, `account` and `label`. `preview: true` exports them to show and keeps none; the module
+  holds that export for 15 minutes, with the seed's unlock key. `fromPreview: true` with `entries` and
+  no PIN then keeps the picks from recent previews, each with its own name, without the card, and
+  forgets the previews. Every pick must come from one wallet and a preview that showed it.
 - `add_status`: an export's progress, `{ ok, job, state, accounts?, error? }`, the state `working`,
   `done` or `failed`.
 - `remove_account`: stop offering an account, `{ ok, removed }`.
