@@ -58,8 +58,14 @@ card exports even public keys only once its PIN is verified:
   code, its parent's key for the parent fingerprint, and the master key for the master fingerprint.
   The id is `keycard-<fingerprint>-<purpose>-<coin>-<account>`. Taproot needs applet 4.0.
 
-They are kept in `accounts.json` in the module's own directory, each with the card's key UID, the
-SHA-256 of its master public key, which SELECT tells before any PIN. An account is `available` while
+They are kept in `accounts.sealed.json` in the module's own directory, each with the card's key UID,
+the SHA-256 of its master public key, which SELECT tells before any PIN. Each key UID's list is sealed
+under the module's key for that seed, `data_key({ seed: <key UID>, scope: "accounts" })` from the signer
+manager ([logos.wallets/1](https://github.com/logos-co/logos-signer-interface/blob/main/docs/wallets.md)),
+asked for when `wallets_changed` says a wallet unlocked. While a seed is locked none of its accounts
+is offered; one added meanwhile waits in memory and joins the list when it unlocks. `card_groups`
+marks such a wallet `locked`, so the app can say why its accounts are missing. The pairings,
+trusted identities and remembered cards stay plain: they are needed before the PIN. An account is `available` while
 a card with that key UID is in a reader. The module looks at the readers every second and a half,
 reads a card when it is inserted and again after each of its own sessions, which can change the
 card's pairing or its PIN tries, and announces a change with `signer_changed` and
@@ -69,6 +75,23 @@ card's pairing or its PIN tries, and announces a change with `signer_changed` an
 another chain code, so every derived key differs while the key UID stays the same. Without one given
 at INIT, the card takes the PUK's first six digits. An account offered under one PIN and signed under
 the other fails with `unavailable`, naming this, since the card's key is not the account's.
+
+## The seed's unlock key
+
+Every account names its `seed`: the card's key UID. The signer manager unlocks that seed's data, in
+every app, with the public key at `m/1280263247'/n'`, which every holder of the seed gives.
+
+- **At add**, in the same PIN session, the card exports the key at `m/1280263247'/0'`, and the module
+  registers the seed with the manager: `enroll_seed({ seed, kind: "keycard", unlockKey, name })`
+  through `logos.wallets/1` (`wallets.lidl`), bound to `signer_manager_module` at runtime and asked
+  without waiting. A card that won't export it still adds; its wallet then unlocks by a password.
+- **`unlock_key`** (`{ seed, index, secret }`, the secret being the PIN, the manager alone) opens the
+  card in the reader holding that key UID, verifies the PIN, checks that the master public key is
+  that seed's, and exports the key at `m/1280263247'/<index>'`. It returns a job once the PIN is
+  checked; `unlock_key_result` gives the key once.
+  - A seed no account comes from is `wrong_seed`, and so is a card that holds another one.
+  - No PIN is `locked`, and a wrong one `wrong_secret`.
+  - Nothing signs under that purpose: an item under it is refused.
 
 ## Signing
 
@@ -89,6 +112,9 @@ counts it as a wrong try.
   it to its key. The answer names the tweaked output key, which the module works out itself: the
   card names the untweaked one.
 
+A Bitcoin request may bring the account's xpub, from the wallet that has it open; one that isn't
+the account's is refused.
+
 Each key the card says it signed with must be the one the module derived, and each signature is
 checked as the manager checks it, with `verify::check`, before the job settles. A card with another
 key, or opened by its alternate PIN, signs nothing for the account.
@@ -103,9 +129,12 @@ a PIN, PUK or pairing password is wiped once read.
 
 The signer interface's methods, as `docs/interface.md` there specifies them:
 
-- `signer_info`: the interface, `keycard`, the three families, `hash`, `showsRequest: false`, and
-  `collects: pin`.
-- `signer_accounts`: the offered accounts, each `available` while its card is in a reader.
+- `signer_info`: the interface, `keycard`, the three families, `hash`, `showsRequest: false`,
+  `collects: pin` and `unlockKey: true`.
+- `signer_accounts`: the offered accounts, each `available` while its card is in a reader, and each
+  naming its `seed`.
+- `unlock_key`, `unlock_key_status`, `unlock_key_result`, `cancel_unlock_key`: the signer manager
+  alone; see [The seed's unlock key](#the-seeds-unlock-key).
 - `sign`: `{ account, kind: "hash", items, secret }`, the secret being the PIN. Returns a job once the
   PIN is verified.
 - `sign_status`, `sign_result`, `cancel_sign`.
@@ -120,6 +149,11 @@ For the Keycard's app:
 - `add_accounts`: `{ families, chain?, account?, label?, reader?, cardId?, pin }` → `{ ok, job }`, once the PIN
   is verified. `chain` is `main` or `test`, `test` by default; `reader` is needed only when more
   than one holds a Keycard. `cardId` optionally pins the physical identity and is checked before PIN verification.
+  For several accounts at once, `entries: [{ family, account, chain?, label? }]` (up to 20) replaces
+  `families`, `account` and `label`. `preview: true` exports them to show and keeps none; the module
+  holds that export for 15 minutes, with the seed's unlock key. `fromPreview: true` with `entries` and
+  no PIN then keeps the picks from recent previews, each with its own name, without the card, and
+  forgets the previews. Every pick must come from one wallet and a preview that showed it.
 - `add_status`: an export's progress, `{ ok, job, state, accounts?, error? }`, the state `working`,
   `done` or `failed`.
 - `remove_account`: stop offering an account, `{ ok, removed }`.

@@ -9,15 +9,17 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bitcoin::bip32::{ChildNumber, Xpub};
 use bitcoin::secp256k1::{PublicKey, Secp256k1};
-use logos_signer_interface::jobs::JobTable;
+use logos_signer_interface::jobs::{JobTable, KeyJobs};
+use logos_signer_interface::unlock::{is_reserved, roster_key, unlock_key_path};
+use logos_signer_interface::wallets::DataKey;
 use logos_signer_interface::{
     verify, Account, Chain, Collects, ErrorCode, Family, HashItem, JobState, JobStatus, Payload,
     RequestKind, Scheme, Secret, SignRequest, Signature, Signer, SignerError, SignerInfo,
-    INTERFACE,
+    UnlockKey, UnlockKeyRequest, INTERFACE,
 };
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +37,9 @@ pub trait Events: Send + Sync {
     fn sign_progress(&self, job: &str, state: JobState);
     fn accounts_changed(&self, count: usize);
     fn device_changed(&self, connected: bool);
+    /// Accounts of a seed were added, with its unlock key at index 0 when the card gave it: the
+    /// glue registers the seed with the signer manager.
+    fn seed_added(&self, _seed: &str, _unlock_key: Option<[u8; 33]>, _name: &str) {}
 }
 
 /// Announces nothing, for tests.
@@ -54,6 +59,7 @@ fn test_chain() -> Chain {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AddRequest {
+    #[serde(default)]
     pub families: Vec<Family>,
     #[serde(default = "test_chain")]
     pub chain: Chain,
@@ -61,12 +67,107 @@ pub struct AddRequest {
     pub account: u32,
     #[serde(default)]
     pub label: Option<String>,
+    /// Several accounts at once, each its own; instead of `families`, `account` and `label`.
+    #[serde(default)]
+    pub entries: Vec<AddEntry>,
+    /// Export the accounts to show them, and keep none yet.
+    #[serde(default)]
+    pub preview: bool,
+    /// Keep accounts `entries` picks from this session's recent previews, with no card access.
+    #[serde(default)]
+    pub from_preview: bool,
     /// Which reader, when more than one holds a Keycard.
     #[serde(default)]
     pub reader: Option<String>,
     #[serde(default)]
     pub card_id: Option<String>,
+    #[serde(default)]
     pub pin: Secret,
+}
+
+/// One account to add: its family, index, network (the request's when absent) and own name.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AddEntry {
+    pub family: Family,
+    #[serde(default)]
+    pub account: u32,
+    #[serde(default)]
+    pub chain: Option<Chain>,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// The most accounts one add exports.
+pub const MAX_ADD: usize = 20;
+
+/// How long a preview's export can be kept from, and how many previews are held.
+const PREVIEW_TTL: Duration = Duration::from_secs(15 * 60);
+const PREVIEWS: usize = 10;
+
+/// A preview's export, held so an add keeps from it without asking the card again.
+struct Preview {
+    at: Instant,
+    offered: Vec<Offered>,
+    unlock_key: Option<[u8; 33]>,
+}
+
+/// Where an entry's account sits.
+fn entry_path(e: &AddEntry, chain: Chain) -> Result<String, SignerError> {
+    match e.family {
+        Family::Evm => Ok(format!("m/44'/60'/0'/0/{}", e.account)),
+        _ => accounts::bitcoin_path(e.family, e.chain.unwrap_or(chain), e.account)
+            .ok_or_else(|| err(ErrorCode::Invalid, "account index")),
+    }
+}
+
+/// The accounts an export shows, each naming its seed.
+fn shown(offered: &[Offered]) -> Vec<Account> {
+    offered
+        .iter()
+        .map(|o| Account {
+            seed: Some(o.key_uid.clone()),
+            ..o.account.clone()
+        })
+        .collect()
+}
+
+impl AddRequest {
+    /// The accounts asked for: `entries`, or each of `families` at `account`.
+    pub fn wanted(&self) -> Result<Vec<AddEntry>, SignerError> {
+        if !self.entries.is_empty() && !self.families.is_empty() {
+            return Err(err(
+                ErrorCode::Invalid,
+                "name families or entries, not both",
+            ));
+        }
+        let out: Vec<AddEntry> = if self.entries.is_empty() {
+            self.families
+                .iter()
+                .map(|f| AddEntry {
+                    family: *f,
+                    account: self.account,
+                    chain: None,
+                    label: self.label.clone(),
+                })
+                .collect()
+        } else {
+            self.entries.clone()
+        };
+        if out.is_empty() {
+            return Err(err(ErrorCode::Invalid, "name at least one family"));
+        }
+        if out.len() > MAX_ADD {
+            return Err(err(
+                ErrorCode::Invalid,
+                format!("at most {MAX_ADD} accounts at once"),
+            ));
+        }
+        if out.iter().any(|e| e.account >= HARDENED) {
+            return Err(err(ErrorCode::Invalid, "account index out of range"));
+        }
+        Ok(out)
+    }
 }
 
 /// Pair a 3.x card, whose secure channel needs it, with its pairing password.
@@ -147,13 +248,18 @@ pub struct CardGroup {
     pub accounts: Vec<Account>,
     pub connections: Vec<serde_json::Value>,
     pub aliases: Vec<String>,
+    /// Its accounts are sealed until the person unlocks the wallet in the Signer app.
+    pub locked: bool,
 }
 
 struct Shared {
     readers: Box<dyn Readers>,
     store: Mutex<Store>,
     jobs: Mutex<JobTable>,
+    /// Unlock-key jobs: read once, by the manager only, and announced nowhere.
+    keys: Mutex<KeyJobs>,
     adds: Mutex<HashMap<String, Added>>,
+    previews: Mutex<Vec<Preview>>,
     cards: Mutex<Vec<Present>>,
     scan: Mutex<()>,
     // No pairing before the module has loaded its persistent store.
@@ -258,6 +364,11 @@ fn plan(offered: &Offered, items: &[HashItem]) -> Result<Vec<Step>, SignerError>
                     .path
                     .clone()
                     .ok_or_else(|| invalid(format!("item {i}: a Bitcoin item names its path")))?;
+                if is_reserved(&path) {
+                    return Err(invalid(format!(
+                        "item {i}: nothing signs under the unlock keys' purpose"
+                    )));
+                }
                 verify::relative(base, &path)?;
                 let tail: Vec<ChildNumber> = parse_path(&path)
                     .zip(parse_path(base))
@@ -367,6 +478,41 @@ fn run(
 }
 
 impl Shared {
+    /// Keep exported accounts, and register their seed with its unlock key.
+    fn keep(
+        &self,
+        offered: Vec<Offered>,
+        unlock_key: Option<[u8; 33]>,
+    ) -> Result<Vec<Account>, SignerError> {
+        let accounts = shown(&offered);
+        let seed = offered.first().map(|o| o.key_uid.clone());
+        lock(&self.store)
+            .put(offered)
+            .map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
+        if let Some(seed) = seed {
+            let name = Some(lock(&self.store).wallet_name(&seed))
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| format!("Keycard {}", seed.get(..8).unwrap_or(&seed)));
+            self.events.seed_added(&seed, unlock_key, &name);
+        }
+        self.events.accounts_changed(lock(&self.store).list().len());
+        Ok(accounts)
+    }
+
+    /// Hold a preview's export, dropping old ones.
+    fn hold_preview(&self, offered: Vec<Offered>, unlock_key: Option<[u8; 33]>) {
+        let mut held = lock(&self.previews);
+        held.retain(|p| p.at.elapsed() < PREVIEW_TTL);
+        if held.len() >= PREVIEWS {
+            held.remove(0);
+        }
+        held.push(Preview {
+            at: Instant::now(),
+            offered,
+            unlock_key,
+        });
+    }
+
     fn hold(self: &Arc<Self>) -> Result<Hold, SignerError> {
         let _scan = lock(&self.scan);
         if self.busy.swap(true, Ordering::SeqCst) {
@@ -614,8 +760,14 @@ impl Shared {
     }
 }
 
+/// The accounts exported, and the seed's unlock key at index 0, read in the same PIN session.
+struct Exported {
+    offered: Vec<Offered>,
+    unlock_key: Option<[u8; 33]>,
+}
+
 /// Export the requested accounts from an opened card.
-fn export(card: &mut Card, req: &AddRequest) -> Result<Vec<Offered>, SignerError> {
+fn export(card: &mut Card, req: &AddRequest) -> Result<Exported, SignerError> {
     let info = card.info();
     let key_uid = info
         .key_uid
@@ -623,14 +775,17 @@ fn export(card: &mut Card, req: &AddRequest) -> Result<Vec<Offered>, SignerError
         .ok_or_else(|| card_error(CardError::NoKey))?;
     let mut master = None;
     let mut out = Vec::new();
-    for family in &req.families {
-        let label = req
-            .label
-            .clone()
-            .or_else(|| Some(default_label(*family, req.chain)));
+    for entry in req.wanted()? {
+        let (family, chain, index) = (
+            &entry.family,
+            entry.chain.unwrap_or(req.chain),
+            entry.account,
+        );
+        // Its own name only: an unnamed account shows as its kind and address, not a stored default.
+        let label = entry.label.clone().filter(|l| !l.trim().is_empty());
         let offered = match family {
             Family::Evm => {
-                let path = format!("m/44'/60'/0'/0/{}", req.account);
+                let path = format!("m/44'/60'/0'/0/{index}");
                 let key = card.export_public(&path).map_err(card_error)?;
                 let mut account = accounts::evm_account(&accounts::evm_address(&key), label);
                 account.path = Some(path);
@@ -652,17 +807,15 @@ fn export(card: &mut Card, req: &AddRequest) -> Result<Vec<Offered>, SignerError
                         ),
                     ));
                 }
-                let path = accounts::bitcoin_path(*family, req.chain, req.account)
+                let path = accounts::bitcoin_path(*family, chain, index)
                     .ok_or_else(|| err(ErrorCode::Invalid, "account index"))?;
                 let fp = master_fingerprint(card, &mut master)?;
                 let parent = card
                     .export_public(accounts::parent_path(&path))
                     .map_err(card_error)?;
                 let (key, code) = card.export_extended(&path).map_err(card_error)?;
-                let account = accounts::xpub(req.chain, &parent, key, code, req.account)
-                    .and_then(|x| {
-                        accounts::bitcoin_account(fp, &x, *family, req.chain, req.account, label)
-                    })
+                let account = accounts::xpub(chain, &parent, key, code, index)
+                    .and_then(|x| accounts::bitcoin_account(fp, &x, *family, chain, index, label))
                     .ok_or_else(|| err(ErrorCode::Invalid, "account index"))?;
                 Offered {
                     account,
@@ -673,7 +826,15 @@ fn export(card: &mut Card, req: &AddRequest) -> Result<Vec<Offered>, SignerError
         };
         out.push(offered);
     }
-    Ok(out)
+    // A card that won't export it still adds: its wallet then unlocks by a password.
+    let unlock_key = unlock_key_path(0)
+        .ok()
+        .and_then(|path| card.export_public(&path).ok())
+        .map(|k| k.serialize());
+    Ok(Exported {
+        offered: out,
+        unlock_key,
+    })
 }
 
 /// The card's master fingerprint, exported once per add.
@@ -687,15 +848,6 @@ fn master_fingerprint(
     let fp = accounts::fingerprint(&card.export_public("m").map_err(card_error)?);
     *cache = Some(fp);
     Ok(fp)
-}
-
-fn default_label(family: Family, chain: Chain) -> String {
-    let test = if chain == Chain::Test { " (test)" } else { "" };
-    match family {
-        Family::Evm => "Keycard EVM".into(),
-        Family::Bitcoin => format!("Keycard native segwit{test}"),
-        Family::BitcoinTaproot => format!("Keycard taproot{test}"),
-    }
 }
 
 /// The module's state, shared with the sessions it runs.
@@ -719,6 +871,19 @@ impl KeycardSigner {
                 ErrorCode::Invalid,
                 "Routed account does not match the request",
             ));
+        }
+        if let (Some(brought), Some(listed)) =
+            (request.xpub.as_deref(), offered.account.xpub.as_deref())
+        {
+            let (family, chain) = (offered.account.family, offered.account.chain);
+            let same =
+                roster_key(family, chain, brought).ok() == roster_key(family, chain, listed).ok();
+            if !same {
+                return Err(err(
+                    ErrorCode::Invalid,
+                    "the request's xpub is not this account's",
+                ));
+            }
         }
         let Payload::Hash { items } = request.payload else {
             return Err(err(
@@ -809,7 +974,9 @@ impl KeycardSigner {
             readers,
             store: Mutex::new(store),
             jobs: Mutex::new(JobTable::new()),
+            keys: Mutex::new(KeyJobs::new()),
             adds: Mutex::new(HashMap::new()),
+            previews: Mutex::new(Vec::new()),
             cards: Mutex::new(Vec::new()),
             scan: Mutex::new(()),
             auto_pairing: AtomicBool::new(false),
@@ -853,6 +1020,38 @@ impl KeycardSigner {
         self.s
             .events
             .accounts_changed(lock(&self.s.store).list().len());
+    }
+
+    /// The wallets whose accounts wait for their key from the signer manager, each with the
+    /// generation its list is sealed under.
+    pub fn closed_seeds(&self) -> Vec<(String, Option<u32>)> {
+        lock(&self.s.store).closed()
+    }
+
+    /// A wallet's key arrived: its accounts are offered.
+    pub fn open_seed(
+        &self,
+        seed: &str,
+        box_key: &DataKey,
+        current: &DataKey,
+    ) -> std::io::Result<()> {
+        let count = {
+            let mut store = lock(&self.s.store);
+            store.unlock(seed, box_key, current)?;
+            store.list().len()
+        };
+        self.s.events.accounts_changed(count);
+        Ok(())
+    }
+
+    /// Wallets were locked: none of their accounts is offered.
+    pub fn lock_seeds(&self) {
+        let count = {
+            let mut store = lock(&self.s.store);
+            store.lock();
+            store.list().len()
+        };
+        self.s.events.accounts_changed(count);
     }
 
     /// The readers holding a card, and what each card's SELECT told.
@@ -915,6 +1114,7 @@ impl KeycardSigner {
                     accounts: vec![],
                     connections: vec![],
                     aliases: vec![],
+                    locked: !uid.is_empty() && store.is_locked(&uid),
                 });
                 g.connected |= connected;
                 if !saved.name.is_empty() && !g.aliases.contains(&saved.name) {
@@ -940,6 +1140,7 @@ impl KeycardSigner {
                 accounts: vec![],
                 connections: vec![],
                 aliases: vec![],
+                locked: false,
             });
             g.connected |= available;
             g.accounts.push(Account {
@@ -1031,12 +1232,11 @@ impl KeycardSigner {
 
     /// Export the requested accounts, once the card's PIN opens it.
     pub fn add_accounts(&self, req: AddRequest) -> Result<String, SignerError> {
-        if req.families.is_empty() {
-            return Err(err(ErrorCode::Invalid, "name at least one family"));
+        req.wanted()?;
+        if req.from_preview {
+            return self.keep_previewed(&req);
         }
-        if req.account >= HARDENED {
-            return Err(err(ErrorCode::Invalid, "account index out of range"));
-        }
+        let preview = req.preview;
         digits(&req.pin, 6, "PIN")?;
         self.s.refresh_if_idle();
         let reader = self.s.reader_named(req.reader.as_deref())?;
@@ -1059,11 +1259,16 @@ impl KeycardSigner {
             req.card_id.clone(),
             move |card| export(card, &req),
             move |s, outcome| {
-                let outcome = outcome.and_then(|offered| {
-                    let accounts = offered.iter().map(|o| o.account.clone()).collect();
-                    lock(&s.store)
-                        .put(offered)
-                        .map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
+                let outcome = outcome.and_then(|exported| {
+                    let Exported {
+                        offered,
+                        unlock_key,
+                    } = exported;
+                    if !preview {
+                        return s.keep(offered, unlock_key);
+                    }
+                    let accounts = shown(&offered);
+                    s.hold_preview(offered, unlock_key);
                     Ok(accounts)
                 });
                 let added = match outcome {
@@ -1078,11 +1283,7 @@ impl KeycardSigner {
                         error: Some(e.message),
                     },
                 };
-                let done = added.state == "done";
                 lock(&s.adds).insert(name, added);
-                if done {
-                    s.events.accounts_changed(lock(&s.store).list().len());
-                }
             },
         );
         if let Err(e) = checked {
@@ -1094,6 +1295,62 @@ impl KeycardSigner {
 
     pub fn add_status(&self, job: &str) -> Option<Added> {
         lock(&self.s.adds).get(job).cloned()
+    }
+
+    /// Keep the accounts `entries` picks from recent previews, each with its own name, and
+    /// forget the previews. Every pick must come from one wallet; nothing touches the card.
+    fn keep_previewed(&self, req: &AddRequest) -> Result<String, SignerError> {
+        if req.preview {
+            return Err(err(ErrorCode::Invalid, "a preview keeps nothing"));
+        }
+        let mut held = lock(&self.s.previews);
+        held.retain(|p| p.at.elapsed() < PREVIEW_TTL);
+        let mut offered: Vec<Offered> = Vec::new();
+        let mut unlock_key = None;
+        for e in req.wanted()? {
+            let path = entry_path(&e, req.chain)?;
+            let (o, key) = held
+                .iter()
+                .rev()
+                .find_map(|p| {
+                    p.offered
+                        .iter()
+                        .find(|o| {
+                            o.account.family == e.family
+                                && o.account.path.as_deref() == Some(path.as_str())
+                        })
+                        .map(|o| (o, p.unlock_key))
+                })
+                .ok_or_else(|| {
+                    err(
+                        ErrorCode::Invalid,
+                        format!("no recent preview shows {path}: show the accounts again"),
+                    )
+                })?;
+            let mut o = o.clone();
+            o.account.label = e.label.clone().filter(|l| !l.trim().is_empty());
+            unlock_key = unlock_key.or(key);
+            offered.push(o);
+        }
+        if offered.iter().any(|o| o.key_uid != offered[0].key_uid) {
+            return Err(err(
+                ErrorCode::Invalid,
+                "these accounts come from different wallets",
+            ));
+        }
+        held.clear();
+        drop(held);
+        let accounts = self.s.keep(offered, unlock_key)?;
+        let job = self.s.next_id("add");
+        lock(&self.s.adds).insert(
+            job.clone(),
+            Added {
+                state: "done",
+                accounts,
+                error: None,
+            },
+        );
+        Ok(job)
     }
 
     /// Stop offering an account. Nothing on the card changes.
@@ -1333,6 +1590,7 @@ impl Signer for KeycardSigner {
             request_kinds: vec![RequestKind::Hash],
             shows_request: false,
             collects: Collects::Pin,
+            unlock_key: true,
         }
     }
 
@@ -1346,6 +1604,7 @@ impl Signer for KeycardSigner {
             .iter()
             .map(|o| Account {
                 available: inserted.contains(&o.key_uid),
+                seed: Some(o.key_uid.clone()),
                 ..o.account.clone()
             })
             .collect())
@@ -1375,6 +1634,74 @@ impl Signer for KeycardSigner {
     /// The card signs in a moment; a cancelled job's signatures are dropped.
     fn cancel(&mut self, job: &str) -> logos_signer_interface::Result<()> {
         lock(&self.s.jobs).cancel(job)
+    }
+
+    /// A seed's unlock key, in a PIN session, once the card proves it holds that seed.
+    fn unlock_key(&mut self, request: UnlockKeyRequest) -> logos_signer_interface::Result<String> {
+        let path = unlock_key_path(request.index)?;
+        let uid = request.seed.trim().to_string();
+        // A locked wallet lists no account, and this is how it unlocks: its seed is known all the same.
+        let known = {
+            let st = lock(&self.s.store);
+            st.seeds().contains(&uid) || st.list().iter().any(|o| o.key_uid == uid)
+        };
+        if !known {
+            return Err(err(
+                ErrorCode::WrongSeed,
+                "no Keycard account comes from this seed",
+            ));
+        }
+        let pin = request
+            .secret
+            .ok_or_else(|| err(ErrorCode::Locked, "enter the Keycard's PIN"))?;
+        digits(&pin, 6, "PIN")?;
+        self.s.refresh_if_idle();
+        let reader = self.s.reader_holding(&uid, Family::Evm)?;
+        let hold = self.s.hold()?;
+        let (job_tx, job_rx) = mpsc::channel::<String>();
+        self.s.with_pin(
+            hold,
+            reader,
+            pin,
+            Some(format!("seed:{uid}")),
+            move |card| {
+                let job = job_rx.recv().ok()?;
+                let outcome = card
+                    .export_public("m")
+                    .map_err(card_error)
+                    .and_then(|root| {
+                        use bitcoin::hashes::{sha256, Hash};
+                        if sha256::Hash::hash(&root.serialize_uncompressed()).to_string() != uid {
+                            return Err(err(ErrorCode::WrongSeed, "this card holds another seed"));
+                        }
+                        let key = card.export_public(&path).map_err(card_error)?;
+                        Ok(UnlockKey {
+                            key: Secret::new(hex::encode(key.serialize())),
+                        })
+                    });
+                Some((job, outcome))
+            },
+            |s, done| {
+                if let Some((job, outcome)) = done {
+                    let _ = lock(&s.keys).finish(&job, outcome);
+                }
+            },
+        )?;
+        let job = lock(&self.s.keys).start(JobState::Working);
+        let _ = job_tx.send(job.clone());
+        Ok(job)
+    }
+
+    fn unlock_key_status(&mut self, job: &str) -> logos_signer_interface::Result<JobStatus> {
+        lock(&self.s.keys).status(job)
+    }
+
+    fn unlock_key_result(&mut self, job: &str) -> logos_signer_interface::Result<UnlockKey> {
+        lock(&self.s.keys).take(job)
+    }
+
+    fn cancel_unlock_key(&mut self, job: &str) -> logos_signer_interface::Result<()> {
+        lock(&self.s.keys).cancel(job)
     }
 }
 
@@ -1413,6 +1740,92 @@ mod grouping_tests {
         }
     }
 
+    fn key(byte: u8) -> DataKey {
+        DataKey {
+            key: Secret::new(hex::encode([byte; 32])),
+            generation: 0,
+        }
+    }
+
+    /// The store kept in `dir`, with `seed-a` unlocked.
+    fn reopened(dir: &std::path::Path) -> Store {
+        let mut store = Store::open(dir).unwrap();
+        store.unlock("seed-a", &key(1), &key(1)).unwrap();
+        store
+    }
+
+    #[test]
+    fn a_locked_wallet_still_asks_its_card_for_the_unlock_key() {
+        let dir = std::env::temp_dir().join(format!("keycard-locked-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir).unwrap();
+        store.put(vec![offered()]).unwrap();
+        store.unlock("seed-a", &key(1), &key(1)).unwrap();
+        // After a restart the wallet is locked: no account listed, its seed known.
+        let store = Store::open(&dir).unwrap();
+        assert!(store.list().is_empty());
+        let mut signer = KeycardSigner::new(Box::new(NoReaders), store, Box::new(Quiet));
+        let ask = |seed: &str| UnlockKeyRequest {
+            seed: seed.into(),
+            index: 0,
+            secret: Some(Secret::new("123456")),
+        };
+        let e = signer.unlock_key(ask("seed-a")).unwrap_err();
+        assert_eq!(
+            e.code,
+            ErrorCode::Unavailable,
+            "it asks for the card: {e:?}"
+        );
+        let e = signer.unlock_key(ask("seed-b")).unwrap_err();
+        assert_eq!(e.code, ErrorCode::WrongSeed, "{e:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn accounts_are_sealed_per_seed_and_offered_only_while_it_is_unlocked() {
+        let dir = std::env::temp_dir().join(format!("keycard-sealed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir).unwrap();
+        store.put(vec![offered()]).unwrap();
+        assert_eq!(store.list().len(), 1, "offered while its key is on its way");
+        assert_eq!(store.closed(), vec![("seed-a".to_string(), None)]);
+        store.unlock("seed-a", &key(1), &key(1)).unwrap();
+        let text = std::fs::read_to_string(dir.join("accounts.sealed.json")).unwrap();
+        assert!(
+            !text.contains("0x0000000000000000000000000000000000000001"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("Savings") && !text.contains("public-key"),
+            "{text}"
+        );
+
+        let mut store = Store::open(&dir).unwrap();
+        assert!(store.list().is_empty(), "locked after a restart");
+        assert_eq!(store.closed(), vec![("seed-a".to_string(), Some(0))]);
+        let mut more = offered();
+        more.account = accounts::evm_account("0x0000000000000000000000000000000000000002", None);
+        store.put(vec![more]).unwrap();
+        assert!(
+            store.list().is_empty(),
+            "an account added while locked waits"
+        );
+        assert!(
+            store.unlock("seed-a", &key(2), &key(2)).is_err(),
+            "another key"
+        );
+        store.unlock("seed-a", &key(1), &key(1)).unwrap();
+        assert_eq!(
+            store.list().len(),
+            2,
+            "and joins its wallet's list when it unlocks"
+        );
+        store.lock();
+        assert!(store.list().is_empty());
+        assert_eq!(reopened(&dir).list().len(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn offered() -> Offered {
         Offered {
             account: accounts::evm_account(
@@ -1447,6 +1860,28 @@ mod grouping_tests {
         assert!(!groups[0].legacy);
         assert!(!groups[0].connected);
         assert_eq!(groups[0].accounts.len(), 1);
+    }
+
+    #[test]
+    fn a_card_whose_wallet_is_locked_says_so_and_offers_nothing() {
+        let dir = std::env::temp_dir().join(format!("keycard-locked-group-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir).unwrap();
+        store.remember_cards(&[card("a", "seed-a", false)]).unwrap();
+        store.put(vec![offered()]).unwrap();
+        store.unlock("seed-a", &key(1), &key(1)).unwrap();
+        let signer = KeycardSigner::new(
+            Box::new(NoReaders),
+            Store::open(&dir).unwrap(),
+            Box::new(Quiet),
+        );
+        let groups = signer.card_groups();
+        assert_eq!((groups.len(), groups[0].locked), (1, true));
+        assert!(groups[0].accounts.is_empty());
+        signer.open_seed("seed-a", &key(1), &key(1)).unwrap();
+        let groups = signer.card_groups();
+        assert_eq!((groups[0].locked, groups[0].accounts.len()), (false, 1));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1530,12 +1965,13 @@ mod grouping_tests {
             ])
             .unwrap();
         store.put(vec![offered()]).unwrap();
+        store.unlock("seed-a", &key(1), &key(1)).unwrap();
         store.rename_card("instance:a", "Daily").unwrap();
         let signer = KeycardSigner::new(Box::new(NoReaders), store, Box::new(Quiet));
         signer.forget_saved_card("instance:a").unwrap();
         signer.forget_saved_card("identity:c").unwrap();
         let store = Store::open(&dir).unwrap();
-        assert!(store.list().is_empty());
+        assert!(store.closed().is_empty(), "its sealed list went too");
         assert_eq!(
             store
                 .cards()
@@ -1651,17 +2087,18 @@ mod grouping_tests {
         let mut expected = offered();
         let id = expected.account.id.clone();
         store.put(vec![expected.clone()]).unwrap();
+        store.unlock("seed-a", &key(1), &key(1)).unwrap();
         store
             .rename_account(&id.to_uppercase(), "  Travel ETH  ")
             .unwrap();
         expected.account.label = Some("Travel ETH".into());
-        assert_eq!(Store::open(&dir).unwrap().find(&id), Some(&expected));
+        assert_eq!(reopened(&dir).find(&id), Some(&expected));
         assert!(store.rename_account("unknown", "Other").is_err());
         assert!(store.rename_account(&id, &"x".repeat(81)).is_err());
         assert!(store.rename_account(&id, "bad\nname").is_err());
         store.rename_account(&id, " ").unwrap();
         expected.account.label = None;
-        assert_eq!(Store::open(&dir).unwrap().find(&id), Some(&expected));
+        assert_eq!(reopened(&dir).find(&id), Some(&expected));
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::write(&dir, "not a directory").unwrap();
         assert!(store.rename_account(&id, "Unsaved").is_err());
