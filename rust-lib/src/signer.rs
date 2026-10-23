@@ -492,7 +492,7 @@ impl Shared {
         if let Some(seed) = seed {
             let name = Some(lock(&self.store).wallet_name(&seed))
                 .filter(|n| !n.is_empty())
-                .unwrap_or_else(|| "Keycard".into());
+                .unwrap_or_else(|| format!("Keycard {}", seed.get(..8).unwrap_or(&seed)));
             self.events.seed_added(&seed, unlock_key, &name);
         }
         self.events.accounts_changed(lock(&self.store).list().len());
