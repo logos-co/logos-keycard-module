@@ -14,14 +14,15 @@ use bitcoin::secp256k1::Secp256k1;
 use keycard_module::accounts;
 use keycard_module::link::Simulator;
 use keycard_module::signer::{
-    AddRequest, ChangePinRequest, KeycardSigner, PairRequest, Quiet, TrustRequest, UnblockRequest,
+    AddEntry, AddRequest, ChangePinRequest, KeycardSigner, PairRequest, Quiet, TrustRequest,
+    UnblockRequest,
 };
 use keycard_module::sim::{self, Setup};
 use keycard_module::store::Store;
 use logos_signer_interface::conformance::{self, Fixture};
 use logos_signer_interface::{
     verify, Account, Chain, ErrorCode, Family, HashItem, JobState, Payload, Scheme, Secret,
-    SignRequest, Signer,
+    SignRequest, Signer, UnlockKeyRequest,
 };
 
 /// BIP86's test vectors, from bitcoin/bips (fetched 2026-10-10), for the "abandon … about"
@@ -104,9 +105,21 @@ fn add_request(families: Vec<Family>, chain: Chain) -> AddRequest {
         chain,
         account: 0,
         label: None,
+        entries: Vec::new(),
+        preview: false,
+        from_preview: false,
         reader: None,
         card_id: None,
         pin: Secret::new(PIN),
+    }
+}
+
+fn entry(family: Family, account: u32, chain: Option<Chain>, label: Option<&str>) -> AddEntry {
+    AddEntry {
+        family,
+        account,
+        chain,
+        label: label.map(Into::into),
     }
 }
 
@@ -132,6 +145,7 @@ fn request(account: &Account, pin: Option<&str>) -> SignRequest {
             items: conformance::items_for(account),
         },
         secret: pin.map(Secret::new),
+        xpub: None,
     }
 }
 
@@ -145,6 +159,8 @@ fn its_accounts_are_the_published_ones_for_the_test_phrase() {
         vec![Family::Evm, Family::Bitcoin, Family::BitcoinTaproot],
         Chain::Main,
     );
+    // Unnamed, an account keeps no name: apps show its kind and address.
+    assert!(got.iter().all(|a| a.label.is_none()), "{got:?}");
     let secp = Secp256k1::new();
     let root = Xpriv::from_str(BIP86_ROOTPRIV).unwrap();
     let evm = root
@@ -338,6 +354,7 @@ fn a_bitcoin_item_signs_only_below_its_account() {
                 }],
             },
             secret: Some(Secret::new(PIN)),
+            xpub: None,
         };
         assert_eq!(k.sign(r).unwrap_err().code, ErrorCode::Invalid, "{path}");
     }
@@ -357,6 +374,7 @@ fn a_bitcoin_item_signs_only_below_its_account() {
                 items: items.clone(),
             },
             secret: Some(Secret::new(PIN)),
+            xpub: None,
         })
         .unwrap();
     assert_eq!(settle(&mut k, &job), JobState::Done);
@@ -519,6 +537,82 @@ fn additional_evm_accounts_use_the_requested_path_and_reject_a_swapped_card() {
     for signature in &signatures {
         verify::check(&second, &items[signature.item], signature).unwrap();
     }
+}
+
+#[test]
+fn accounts_a_preview_showed_are_kept_from_it_without_the_card() {
+    let Some(addr) = simulator() else { return };
+    let _turn = turn();
+    let mut k = rig(&addr, &Setup::default());
+    let mut req = add_request(Vec::new(), Chain::Main);
+    req.entries = (0..5).map(|i| entry(Family::Evm, i, None, None)).collect();
+    req.preview = true;
+    let page = exported(&k, req).unwrap();
+    let mut req = add_request(Vec::new(), Chain::Main);
+    req.entries = vec![entry(Family::Bitcoin, 2, None, None)];
+    req.preview = true;
+    let btc = exported(&k, req).unwrap();
+
+    // No PIN: the picks come from the two previews, each with its own name or none.
+    let mut keep = add_request(Vec::new(), Chain::Main);
+    keep.pin = Secret::default();
+    keep.from_preview = true;
+    keep.entries = vec![
+        entry(Family::Evm, 4, None, Some("Rent")),
+        entry(Family::Bitcoin, 2, None, None),
+    ];
+    let kept = exported(&k, keep.clone()).unwrap();
+    assert_eq!(kept[0].id, page[4].id);
+    assert_eq!(kept[0].label.as_deref(), Some("Rent"));
+    assert_eq!(kept[1].id, btc[0].id);
+    assert_eq!(kept[1].label, None);
+    assert_eq!(k.accounts().unwrap().len(), 2);
+
+    // Keeping forgets the previews, and an account no preview showed is refused.
+    assert!(k.add_accounts(keep).is_err(), "kept twice");
+    let mut unseen = add_request(Vec::new(), Chain::Main);
+    unseen.from_preview = true;
+    unseen.entries = vec![entry(Family::Evm, 9, None, None)];
+    assert!(k.add_accounts(unseen).is_err(), "never previewed");
+}
+
+#[test]
+fn a_preview_keeps_nothing_and_entries_add_each_account_with_its_own_name() {
+    let Some(addr) = simulator() else { return };
+    let _turn = turn();
+    let mut k = rig(&addr, &Setup::default());
+    let mut req = add_request(Vec::new(), Chain::Main);
+    req.entries = vec![
+        entry(Family::Evm, 0, None, None),
+        entry(Family::Evm, 3, None, Some("Savings")),
+        entry(Family::Bitcoin, 1, Some(Chain::Test), None),
+    ];
+    req.preview = true;
+    let shown = exported(&k, req.clone()).unwrap();
+    assert_eq!(shown.len(), 3);
+    assert_eq!(shown[1].path.as_deref(), Some("m/44'/60'/0'/0/3"));
+    assert_eq!(shown[2].path.as_deref(), Some("m/84'/1'/1'"));
+    assert!(k.accounts().unwrap().is_empty(), "a preview keeps nothing");
+
+    req.preview = false;
+    let added = exported(&k, req.clone()).unwrap();
+    assert_eq!(
+        added.iter().map(|a| a.id.clone()).collect::<Vec<_>>(),
+        shown.iter().map(|a| a.id.clone()).collect::<Vec<_>>(),
+        "the add keeps the accounts the preview showed"
+    );
+    assert_eq!(added[1].label.as_deref(), Some("Savings"));
+    assert_eq!(added[0].label, None);
+    assert_eq!(k.accounts().unwrap().len(), 3);
+
+    req.families = vec![Family::Evm];
+    assert!(
+        k.add_accounts(req.clone()).is_err(),
+        "families and entries both"
+    );
+    req.families.clear();
+    req.entries = (0..21).map(|i| entry(Family::Evm, i, None, None)).collect();
+    assert!(k.add_accounts(req).is_err(), "more than twenty");
 }
 
 #[test]
@@ -998,4 +1092,67 @@ fn v3_setup_without_custom_password_pairs_automatically() {
         "default setup should pair without another prompt"
     );
     admin(&k, "status", serde_json::json!({}));
+}
+
+#[test]
+fn the_card_gives_its_phrases_unlock_key_after_its_pin_and_only_for_its_seed() {
+    let Some(addr) = simulator() else { return };
+    let _turn = turn();
+    let mut k = rig(&addr, &Setup::default());
+    let added = add(&k, vec![Family::Evm], Chain::Test);
+    let seed = added[0].seed.clone().expect("the account names its seed");
+    assert_eq!(
+        k.accounts().unwrap()[0].seed.as_deref(),
+        Some(seed.as_str())
+    );
+
+    // The phrase's own key at m/1280263247'/n', as any other holder of it gives.
+    let secp = Secp256k1::new();
+    let phrase = bip39::Mnemonic::parse(sim::TEST_PHRASE).unwrap();
+    let master = Xpriv::new_master(bitcoin::NetworkKind::Test, &phrase.to_seed("")).unwrap();
+    let want = |n: u32| {
+        let path = DerivationPath::from_str(&format!("m/1280263247'/{n}'")).unwrap();
+        hex::encode(
+            Xpub::from_priv(&secp, &master.derive_priv(&secp, &path).unwrap())
+                .public_key
+                .serialize(),
+        )
+    };
+    let key = |k: &mut KeycardSigner,
+               seed: &str,
+               n: u32,
+               pin: Option<&str>|
+     -> Result<String, ErrorCode> {
+        let job = k
+            .unlock_key(UnlockKeyRequest {
+                seed: seed.into(),
+                index: n,
+                secret: pin.map(Secret::new),
+            })
+            .map_err(|e| e.code)?;
+        for _ in 0..100 {
+            let st = k.unlock_key_status(&job).unwrap();
+            if st.state.is_final() {
+                return match st.state {
+                    JobState::Done => {
+                        Ok(k.unlock_key_result(&job).unwrap().key.expose().to_string())
+                    }
+                    _ => Err(st.error.map(|e| e.code).unwrap_or(ErrorCode::Internal)),
+                };
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("the unlock key never came");
+    };
+    assert_eq!(key(&mut k, &seed, 0, Some(PIN)).unwrap(), want(0));
+    assert_eq!(key(&mut k, &seed, 1, Some(PIN)).unwrap(), want(1));
+    assert_eq!(
+        key(&mut k, &seed, 0, Some("654321")).unwrap_err(),
+        ErrorCode::WrongSecret
+    );
+    assert_eq!(key(&mut k, &seed, 0, None).unwrap_err(), ErrorCode::Locked);
+    assert_eq!(
+        key(&mut k, &"00".repeat(32), 0, Some(PIN)).unwrap_err(),
+        ErrorCode::WrongSeed
+    );
 }

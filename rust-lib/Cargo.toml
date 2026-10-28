@@ -21,7 +21,7 @@ path = "src/bin/simulator_setup.rs"
 required-features = ["simulator"]
 
 [dependencies]
-logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "313ad6abf3b028fc44cfad41dc227a8b9aa3ec85" }
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "d8cfff84327c9b2b5cdb9702d1c4217cad567cee" }
 # The Keycard's commands and both secure channels; PC/SC is this crate's own, below.
 keycard-rs = { git = "https://github.com/keycard-tech/keycard-rs", rev = "142ab915eda6bc4c1dc10078028f0d7b0748b218", default-features = false }
 # BIP32 keys, ECDSA with recovery, BIP340 and the taproot tweak. The plugin's export list keeps libsecp256k1 in.
@@ -40,7 +40,7 @@ pcsc = { version = "2", optional = true }
 logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
 
 [dev-dependencies]
-logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "313ad6abf3b028fc44cfad41dc227a8b9aa3ec85", features = ["mock", "conformance"] }
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "d8cfff84327c9b2b5cdb9702d1c4217cad567cee", features = ["mock", "conformance"] }
 
 [features]
 default = ["logos_module", "pcsc"]
