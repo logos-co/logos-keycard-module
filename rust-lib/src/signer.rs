@@ -40,6 +40,8 @@ pub trait Events: Send + Sync {
     /// Accounts of a seed were added, with its unlock key at index 0 when the card gave it: the
     /// glue registers the seed with the signer manager.
     fn seed_added(&self, _seed: &str, _unlock_key: Option<[u8; 33]>, _name: &str) {}
+    /// The person renamed a seed's wallet here: the glue gives the name to the signer manager.
+    fn seed_named(&self, _seed: &str, _name: &str) {}
 }
 
 /// Announces nothing, for tests.
@@ -1163,16 +1165,30 @@ impl KeycardSigner {
 
     pub fn rename_card(&self, id: &str, name: &str) -> Result<(), SignerError> {
         if let Some(uid) = id.strip_prefix("seed:") {
-            lock(&self.s.store)
-                .rename_wallet(uid, name)
-                .map_err(|e| err(ErrorCode::Invalid, e.to_string()))?;
-            self.s
-                .events
-                .accounts_changed(lock(&self.s.store).list().len());
+            self.take_wallet_name(uid, name)?;
+            if let Some(name) = self.own_wallet_name(uid) {
+                self.s.events.seed_named(uid, &name);
+            }
             return Ok(());
         }
         lock(&self.s.store)
             .rename_card(id, name)
+            .map_err(|e| err(ErrorCode::Invalid, e.to_string()))?;
+        self.s
+            .events
+            .accounts_changed(lock(&self.s.store).list().len());
+        Ok(())
+    }
+
+    /// The name the person gave a wallet here, by its key UID: its own, else its card's.
+    pub fn own_wallet_name(&self, uid: &str) -> Option<String> {
+        Some(lock(&self.s.store).wallet_name(uid)).filter(|n| !n.trim().is_empty())
+    }
+
+    /// A wallet's name, kept here without sending it on: the person may have given it in another app.
+    pub fn take_wallet_name(&self, uid: &str, name: &str) -> Result<(), SignerError> {
+        lock(&self.s.store)
+            .rename_wallet(uid, name)
             .map_err(|e| err(ErrorCode::Invalid, e.to_string()))?;
         self.s
             .events
@@ -1882,6 +1898,37 @@ mod grouping_tests {
         let groups = signer.card_groups();
         assert_eq!((groups[0].locked, groups[0].accounts.len()), (false, 1));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Records the names sent on to the signer manager.
+    struct Named(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
+
+    impl Events for Named {
+        fn sign_progress(&self, _: &str, _: JobState) {}
+        fn accounts_changed(&self, _: usize) {}
+        fn device_changed(&self, _: bool) {}
+        fn seed_named(&self, seed: &str, name: &str) {
+            self.0.lock().unwrap().push((seed.into(), name.into()));
+        }
+    }
+
+    #[test]
+    fn a_wallet_renamed_here_is_sent_on_and_a_name_taken_from_elsewhere_is_not() {
+        let mut store = Store::new();
+        store.put(vec![offered()]).unwrap();
+        store.remember_cards(&[card("a", "seed-a", false)]).unwrap();
+        store.rename_card("instance:a", "White Card").unwrap();
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let signer = KeycardSigner::new(Box::new(NoReaders), store, Box::new(Named(sent.clone())));
+        assert_eq!(signer.own_wallet_name("seed-a").as_deref(), Some("White Card"), "its card's until it has one");
+        signer.rename_card("seed:seed-a", "  Savings ").unwrap();
+        signer.take_wallet_name("seed-a", "Cold").unwrap();
+        assert_eq!(signer.own_wallet_name("seed-a").as_deref(), Some("Cold"));
+        // Emptied, it has no name of the person's to send.
+        signer.rename_card("seed:seed-a", "").unwrap();
+        assert_eq!(signer.own_wallet_name("seed-a"), None);
+        signer.rename_card("instance:a", "Daily").unwrap();
+        assert_eq!(*sent.lock().unwrap(), vec![("seed-a".to_string(), "Savings".to_string())]);
     }
 
     #[test]

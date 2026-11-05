@@ -4,6 +4,7 @@
 //! Every reply is a JSON string: `{ "ok": true, ... }` or `{ "ok": false, "error": "...", "code"? }`.
 //! A request that carries a PIN, PUK or pairing password is wiped once read.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use logos_signer_interface::json as signer_json;
@@ -16,7 +17,9 @@ use crate::signer::{
     AddRequest, ChangePinRequest, Events, KeycardSigner, PairRequest, TrustRequest, UnblockRequest,
 };
 use crate::store::Store;
-use logos_signer_interface::wallets::{read_data_key, DataKey, DataKeyRequest};
+use logos_signer_interface::wallets::{
+    name_steps, read_data_key, read_wallets, DataKey, DataKeyRequest, NameSeed, NameStep,
+};
 
 pub trait KeycardModule: Send + Sync + 'static {
     // ── logos.signer/1 ──────────────────────────────────────────────────
@@ -103,6 +106,9 @@ impl Events for Emit {
         );
         wallets::WalletsClient::bind(WALLETS).enroll_seed_async(&body, |_| {});
     }
+    fn seed_named(&self, seed: &str, name: &str) {
+        send_name(seed, name);
+    }
     fn sign_progress(&self, job: &str, state: JobState) {
         emit_sign_progress(job, state.as_str());
     }
@@ -127,10 +133,13 @@ fn watch_wallets(keycard: KeycardSigner) {
     let locked = client.on_wallets_locked();
     let k = keycard.clone();
     std::thread::spawn(move || {
+        let mut sent = HashSet::new();
         open_wallets(&k);
+        sync_names(&k, &mut sent);
         if let Ok(sub) = changed {
             for _ in sub {
                 open_wallets(&k);
+                sync_names(&k, &mut sent);
             }
         }
     });
@@ -161,6 +170,43 @@ fn open_wallets(keycard: &KeycardSigner) {
         if let Err(e) = keycard.open_seed(&seed, &box_key, &current) {
             eprintln!("keycard_module: a wallet's accounts didn't open: {e}");
         }
+    }
+}
+
+/// One name per wallet: take the name the person gave in any app, and send one given here while
+/// the wallet has none, once a run.
+fn sync_names(keycard: &KeycardSigner, sent: &mut HashSet<String>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    wallets::WalletsClient::bind(WALLETS).wallets_async_with_timeout(
+        Duration::from_secs(10),
+        move |r| {
+            let _ = tx.send(r);
+        },
+    );
+    let Some(listed) = rx.recv().ok().and_then(|r| r.ok()).and_then(|r| read_wallets(&r).ok())
+    else {
+        return;
+    };
+    for step in name_steps(&listed, |uid| keycard.own_wallet_name(uid)) {
+        match step {
+            NameStep::Take { seed, name } => {
+                if let Err(e) = keycard.take_wallet_name(&seed, &name) {
+                    eprintln!("keycard_module: a wallet's name didn't apply: {}", e.message);
+                }
+            }
+            NameStep::Send { seed, name } => {
+                if sent.insert(seed.clone()) {
+                    send_name(&seed, &name);
+                }
+            }
+        }
+    }
+}
+
+fn send_name(seed: &str, name: &str) {
+    let body = NameSeed { seed: seed.into(), name: name.into() };
+    if let Ok(body) = serde_json::to_string(&body) {
+        wallets::WalletsClient::bind(WALLETS).name_seed_async(&body, |_| {});
     }
 }
 
