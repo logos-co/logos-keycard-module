@@ -57,7 +57,9 @@ The applet computes this UID as SHA-256 of the full SEC1 uncompressed master pub
 `connections` keeps the physical card IDs and reader availability separate; `aliases`
 retains previous card names when wallets merge. `rename_card` and `forget_saved_card`
 also accept seed IDs. Seed wallet names are saved in `wallet_names.json`, with old card
-names used as the migration fallback. Pairing, trust and PIN handling remain per card.
+names used as the migration fallback. A wallet's name is shared with the signer manager, so the
+Signer and keys apps show the same one (see docs/specs.md, "One name per wallet"). Pairing,
+trust and PIN handling remain per card.
 Re-exporting an existing account keeps its label. A seed change creates a different group.
 
 ### Signing across connections

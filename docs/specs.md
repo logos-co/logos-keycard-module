@@ -248,6 +248,14 @@ fallback, and all original card names are retained in `aliases`. Names are trimm
 limited to 80 characters, and cannot contain control characters. Re-exporting an account
 keeps its saved label; conflicting full public keys cannot overwrite an existing account ID.
 
+**One name per wallet.** The signer manager keeps the name every app shows (`logos.wallets/1`):
+- Renaming a seed wallet here (`rename_card("seed:<keyUid>", name)`) sends the name on with
+  `name_seed({ seed: keyUid, name })`, asked without waiting. An emptied name sends nothing. The
+  manager allows 64 characters.
+- At start and on each `wallets_changed`, the module reads `wallets()`. It takes the name of each
+  wallet it holds that is `named`, without sending it back. For one not named yet, it sends its own
+  name, the wallet's or else its card's, once a run.
+
 `forget_saved_card(seedId)` removes a disconnected seed wallet's offers, name and seed
 associations while retaining physical pairing/trust metadata. For compatibility, passing
 a physical card ID retains the previous card-specific forget behavior (name, pairing,
