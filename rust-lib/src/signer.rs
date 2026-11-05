@@ -1920,7 +1920,11 @@ mod grouping_tests {
         store.rename_card("instance:a", "White Card").unwrap();
         let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let signer = KeycardSigner::new(Box::new(NoReaders), store, Box::new(Named(sent.clone())));
-        assert_eq!(signer.own_wallet_name("seed-a").as_deref(), Some("White Card"), "its card's until it has one");
+        assert_eq!(
+            signer.own_wallet_name("seed-a").as_deref(),
+            Some("White Card"),
+            "its card's until it has one"
+        );
         signer.rename_card("seed:seed-a", "  Savings ").unwrap();
         signer.take_wallet_name("seed-a", "Cold").unwrap();
         assert_eq!(signer.own_wallet_name("seed-a").as_deref(), Some("Cold"));
@@ -1928,7 +1932,10 @@ mod grouping_tests {
         signer.rename_card("seed:seed-a", "").unwrap();
         assert_eq!(signer.own_wallet_name("seed-a"), None);
         signer.rename_card("instance:a", "Daily").unwrap();
-        assert_eq!(*sent.lock().unwrap(), vec![("seed-a".to_string(), "Savings".to_string())]);
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![("seed-a".to_string(), "Savings".to_string())]
+        );
     }
 
     #[test]
