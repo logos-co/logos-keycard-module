@@ -15,7 +15,7 @@ use bitcoin::bip32::{ChildNumber, Xpub};
 use bitcoin::secp256k1::{PublicKey, Secp256k1};
 use logos_signer_interface::jobs::{JobTable, KeyJobs};
 use logos_signer_interface::unlock::{is_reserved, roster_key, unlock_key_path};
-use logos_signer_interface::wallets::DataKey;
+use logos_signer_interface::wallets::{DataKey, Wallet};
 use logos_signer_interface::{
     verify, Account, Chain, Collects, ErrorCode, Family, HashItem, JobState, JobStatus, Payload,
     RequestKind, Scheme, Secret, SignRequest, Signature, Signer, SignerError, SignerInfo,
@@ -42,6 +42,8 @@ pub trait Events: Send + Sync {
     fn seed_added(&self, _seed: &str, _unlock_key: Option<[u8; 33]>, _name: &str) {}
     /// The person renamed a seed's wallet here: the glue gives the name to the signer manager.
     fn seed_named(&self, _seed: &str, _name: &str) {}
+    /// A seed's wallet went for good, forgotten or with its last card: the glue tells the manager.
+    fn seed_forgotten(&self, _seed: &str) {}
 }
 
 /// Announces nothing, for tests.
@@ -1211,12 +1213,13 @@ impl KeycardSigner {
                     "Remove this wallet's Keycards from their readers before forgetting it.",
                 ));
             }
-            lock(&self.s.store)
+            let gone = lock(&self.s.store)
                 .forget_wallet(uid)
                 .map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
             self.s
                 .events
                 .accounts_changed(lock(&self.s.store).list().len());
+            self.forgotten(gone);
             return Ok(());
         }
         let _hold = self.s.hold()?;
@@ -1243,7 +1246,19 @@ impl KeycardSigner {
         self.s
             .events
             .accounts_changed(lock(&self.s.store).list().len());
-        result
+        result.map(|gone| self.forgotten(gone))
+    }
+
+    fn forgotten(&self, gone: Vec<String>) {
+        for seed in gone {
+            self.s.events.seed_forgotten(&seed);
+        }
+    }
+
+    /// The wallets the signer manager still lists this module holding, forgotten here before it
+    /// could hear of it: each one to forget there too.
+    pub fn stale_wallets(&self, listed: &[Wallet]) -> Vec<String> {
+        lock(&self.s.store).stale(listed)
     }
 
     /// Export the requested accounts, once the card's PIN opens it.
@@ -2053,12 +2068,149 @@ mod grouping_tests {
             .remember_cards(&[card("a", "seed-a", false), card("b", "seed-a", true)])
             .unwrap();
         store.put(vec![offered()]).unwrap();
-        store.forget_saved_card("instance:a").unwrap();
+        // The wallet stays in the manager while another card holds it.
+        assert!(store.forget_saved_card("instance:a").unwrap().is_empty());
         assert_eq!(store.list().len(), 1);
         assert_eq!(store.cards().len(), 1);
-        store.forget_saved_card("identity:b").unwrap();
+        assert_eq!(
+            store.forget_saved_card("identity:b").unwrap(),
+            vec!["seed-a"]
+        );
         assert!(store.list().is_empty());
         assert!(store.cards().is_empty());
+    }
+
+    /// Records the seeds the signer manager is told to forget.
+    struct Forgot(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl Events for Forgot {
+        fn sign_progress(&self, _: &str, _: JobState) {}
+        fn accounts_changed(&self, _: usize) {}
+        fn device_changed(&self, _: bool) {}
+        fn seed_forgotten(&self, seed: &str) {
+            self.0.lock().unwrap().push(seed.into());
+        }
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("keycard-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    fn listed(held: &[&str]) -> Vec<logos_signer_interface::wallets::Wallet> {
+        let mut wallets: Vec<_> = held
+            .iter()
+            .map(|s| {
+                let seed = format!("w_{s}");
+                serde_json::json!({ "seed": seed, "name": s, "locked": true, "holderSeed": s })
+            })
+            .collect();
+        // Another holder's wallet: no holder seed of this module's.
+        wallets.push(serde_json::json!({ "seed": "w_other", "name": "Shell", "locked": false }));
+        let reply = serde_json::json!({ "ok": true, "wallets": wallets }).to_string();
+        logos_signer_interface::wallets::read_wallets(&reply).unwrap()
+    }
+
+    #[test]
+    fn the_manager_forgets_a_wallet_with_its_last_card_or_when_it_is_forgotten() {
+        let mut store = Store::new();
+        store
+            .remember_cards(&[
+                card("a", "seed-a", false),
+                card("b", "seed-a", true),
+                card("c", "seed-c", false),
+            ])
+            .unwrap();
+        store.put(vec![offered()]).unwrap();
+        let told = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let signer = KeycardSigner::new(Box::new(NoReaders), store, Box::new(Forgot(told.clone())));
+        signer.forget_saved_card("instance:a").unwrap();
+        assert!(told.lock().unwrap().is_empty(), "card b still holds seed-a");
+        signer.forget_saved_card("identity:b").unwrap();
+        signer.forget_saved_card("seed:seed-c").unwrap();
+        // A wallet the store never had isn't the manager's business.
+        signer.forget_saved_card("seed:seed-x").unwrap();
+        assert_eq!(*told.lock().unwrap(), vec!["seed-a", "seed-c"]);
+    }
+
+    #[test]
+    fn a_failed_forget_tells_the_manager_nothing_until_it_is_retried() {
+        let dir = scratch("forget-told");
+        let mut store = Store::open(&dir).unwrap();
+        store.remember_cards(&[card("a", "seed-a", false)]).unwrap();
+        store.put(vec![offered()]).unwrap();
+        std::fs::remove_file(dir.join("cards.json")).unwrap();
+        std::fs::create_dir(dir.join("cards.json")).unwrap();
+        let told = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let signer = KeycardSigner::new(Box::new(NoReaders), store, Box::new(Forgot(told.clone())));
+        assert!(signer.forget_saved_card("instance:a").is_err());
+        assert!(told.lock().unwrap().is_empty());
+        std::fs::remove_dir(dir.join("cards.json")).unwrap();
+        signer.forget_saved_card("instance:a").unwrap();
+        assert_eq!(*told.lock().unwrap(), vec!["seed-a"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stale_wallets_are_the_held_ones_the_store_no_longer_has() {
+        let dir = scratch("stale");
+        let mut store = Store::open(&dir).unwrap();
+        // seed-a: sealed accounts and no card; seed-b: a card and no accounts; seed-c: shared.
+        store.put(vec![offered()]).unwrap();
+        store.unlock("seed-a", &key(1), &key(1)).unwrap();
+        store
+            .remember_cards(&[
+                card("b", "seed-b", false),
+                card("c1", "seed-c", false),
+                card("c2", "seed-c", true),
+            ])
+            .unwrap();
+        store.forget_saved_card("instance:c1").unwrap();
+        drop(store);
+        let store = Store::open(&dir).unwrap();
+        let all = listed(&["seed-a", "seed-b", "seed-c", "seed-gone", " seed-d "]);
+        assert_eq!(store.stale(&all), vec!["seed-gone", "seed-d"]);
+        let signer = KeycardSigner::new(Box::new(NoReaders), store, Box::new(Quiet));
+        assert_eq!(signer.stale_wallets(&all), vec!["seed-gone", "seed-d"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_wallet_forgotten_without_telling_the_manager_is_stale() {
+        let dir = scratch("stale-forgotten");
+        let mut store = Store::open(&dir).unwrap();
+        store.remember_cards(&[card("a", "seed-a", false)]).unwrap();
+        store.put(vec![offered()]).unwrap();
+        store.unlock("seed-a", &key(1), &key(1)).unwrap();
+        store.forget_wallet("seed-a").unwrap();
+        drop(store);
+        let store = Store::open(&dir).unwrap();
+        assert_eq!(store.stale(&listed(&["seed-a"])), vec!["seed-a"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_store_not_read_from_disk_finds_nothing_stale() {
+        let held = listed(&["seed-a"]);
+        assert!(
+            Store::new().stale(&held).is_empty(),
+            "in memory, before a store loads"
+        );
+        let dir = scratch("stale-empty");
+        assert!(
+            Store::open(&dir).unwrap().stale(&held).is_empty(),
+            "a directory with no files of a run"
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cards.json"), "not json").unwrap();
+        assert!(
+            Store::open(&dir).is_err(),
+            "an unreadable store loads nothing"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

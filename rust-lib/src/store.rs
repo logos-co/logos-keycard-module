@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use crate::card::CardInfo;
 use keycard_rs::Pairing;
 use logos_signer_interface::sealed::SealedDocs;
-use logos_signer_interface::wallets::DataKey;
+use logos_signer_interface::wallets::{stale_seeds, DataKey, Wallet};
 use logos_signer_interface::Account;
 use serde::{Deserialize, Serialize};
 
@@ -73,7 +73,12 @@ pub struct Store {
     trusted: Vec<String>,
     cards: Vec<SavedCard>,
     wallet_names: BTreeMap<String, String>,
+    /// Read from files a run before this one wrote: only then does a missing wallet mean forgotten.
+    found: bool,
 }
+
+/// The files that record wallets: with none of them, the store knows of no wallet to have lost.
+const WALLET_FILES: [&str; 3] = ["accounts.sealed.json", "cards.json", "wallet_names.json"];
 
 fn read<T: Default + for<'de> Deserialize<'de>>(path: &Path) -> std::io::Result<T> {
     match std::fs::read(path) {
@@ -111,6 +116,7 @@ impl Default for Store {
             trusted: Vec::new(),
             cards: Vec::new(),
             wallet_names: BTreeMap::new(),
+            found: false,
         }
     }
 }
@@ -125,6 +131,7 @@ impl Store {
     /// stay sealed until each seed's key arrives ([`Store::unlock`]).
     pub fn open(dir: impl Into<PathBuf>) -> std::io::Result<Self> {
         let dir = dir.into();
+        let found = WALLET_FILES.iter().any(|f| dir.join(f).exists());
         let docs = SealedDocs::load(dir.join("accounts.sealed.json"), ACCOUNTS)
             .map_err(|e| std::io::Error::other(e.message))?;
         let paired = read::<Pairings>(&dir.join("pairings.json"))?.pairings;
@@ -139,7 +146,32 @@ impl Store {
             trusted,
             wallet_names: read(&dir.join("wallet_names.json"))?,
             cards,
+            found,
         })
+    }
+
+    /// Whether anything of a wallet is kept here: its accounts, sealed, open or waiting, or a
+    /// remembered card with its key UID. Its name alone doesn't count.
+    pub fn has_wallet(&self, uid: &str) -> bool {
+        self.docs.seeds().iter().any(|s| s == uid)
+            || self
+                .offered
+                .iter()
+                .chain(&self.waiting)
+                .any(|o| o.key_uid == uid)
+            || self
+                .cards
+                .iter()
+                .any(|c| c.key_uids.iter().any(|k| k == uid))
+    }
+
+    /// The wallets the signer manager lists this module holding that the store no longer has.
+    /// None unless the store was read from a run's files, so an empty read forgets nothing.
+    pub fn stale(&self, listed: &[Wallet]) -> Vec<String> {
+        if !self.found {
+            return Vec::new();
+        }
+        stale_seeds(listed, |uid| self.has_wallet(uid))
     }
 
     pub fn wallet_name(&self, uid: &str) -> String {
@@ -176,7 +208,13 @@ impl Store {
         Ok(())
     }
 
-    pub fn forget_wallet(&mut self, uid: &str) -> std::io::Result<()> {
+    /// Forget a wallet everywhere here. The wallet, when the store had it: to forget in the manager.
+    pub fn forget_wallet(&mut self, uid: &str) -> std::io::Result<Vec<String>> {
+        let had = if self.has_wallet(uid) {
+            vec![uid.to_string()]
+        } else {
+            Vec::new()
+        };
         self.docs
             .remove(uid)
             .map_err(|e| std::io::Error::other(e.message))?;
@@ -198,7 +236,12 @@ impl Store {
             )?;
         }
         self.wallet_names = names;
-        Ok(())
+        Ok(self.gone(had))
+    }
+
+    /// Of the wallets `had`, those nothing here keeps any more.
+    fn gone(&self, had: Vec<String>) -> Vec<String> {
+        had.into_iter().filter(|u| !self.has_wallet(u)).collect()
     }
 
     pub fn cards(&self) -> &[SavedCard] {
@@ -254,7 +297,8 @@ impl Store {
     /// Forget local records, retaining offers also associated with another remembered card.
     /// Commit each file before changing its in-memory counterpart. Keep the card record last,
     /// so a failed cleanup remains visible and can be retried without resurrecting removed data.
-    pub fn forget_saved_card(&mut self, id: &str) -> std::io::Result<()> {
+    /// The wallets that went with it, no other card keeping them: to forget in the manager.
+    pub fn forget_saved_card(&mut self, id: &str) -> std::io::Result<Vec<String>> {
         let card = self
             .cards
             .iter()
@@ -317,7 +361,8 @@ impl Store {
             )?;
         }
         self.trusted = trusted;
-        self.save_cards(cards)
+        self.save_cards(cards)?;
+        Ok(self.gone(card.key_uids))
     }
 
     fn save_cards(&mut self, next: Vec<SavedCard>) -> std::io::Result<()> {
