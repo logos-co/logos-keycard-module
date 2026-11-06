@@ -262,6 +262,17 @@ a physical card ID retains the previous card-specific forget behavior (name, pai
 trust and exclusive offers). `forget_card(identity)` only revokes trust. None of these
 operations erase card keys or pairing slots. Partial disk cleanup failures are surfaced.
 
+**A wallet forgotten here leaves the signer manager.** A wallet goes for good when
+`forget_saved_card` forgets its seed ID, or the last remembered card with its key UID. The module
+then sends `forget_seed({ seed: keyUid })` (`logos.wallets/1`), asked without waiting; the manager
+drops this holder, and the wallet once no holder is left. A wallet another remembered card still
+holds stays. A failed forget sends nothing, and a refusal is only logged.
+- On each read of `wallets()`, the module also forgets, once a run, each wallet the manager lists
+  it holding that it no longer has: no accounts, sealed or open, and no remembered card with that
+  key UID. So a wallet forgotten before this goes too.
+- Only a store read from an earlier run's files counts. One that failed to load, or found none of
+  `accounts.sealed.json`, `cards.json` and `wallet_names.json`, forgets nothing.
+
 The simulator tests verify the applet key UID against a known master public key and cover
 shared seeds, availability, naming, forgetting and signing without touching real devices.
 

@@ -36,8 +36,10 @@ Licensed under MIT or Apache-2.0.
 
 Each identified card group has **Forget Keycard…**. Remove the card from its reader, then
 confirm to remove its saved name, local pairing/trust and accounts offered only by that card.
-Accounts associated with another remembered card are retained. Nothing is erased on the card;
-reinserting it discovers it again, with pairing/trust and account offering available as before.
+Accounts associated with another remembered card are retained. A wallet that was on this card
+alone leaves the signer manager too (`forget_seed`), so the Signer app stops listing it. Nothing
+is erased on the card; reinserting it discovers it again, with pairing/trust and account offering
+available as before.
 The backend checks reader presence itself and refuses while another card operation is active.
 A failed local cleanup leaves the card record visible for retry and reports the error.
 
@@ -56,8 +58,9 @@ Account labels can be changed locally with `rename_account(id, name)`. Names are
 The applet computes this UID as SHA-256 of the full SEC1 uncompressed master public key.
 `connections` keeps the physical card IDs and reader availability separate; `aliases`
 retains previous card names when wallets merge. `rename_card` and `forget_saved_card`
-also accept seed IDs. Seed wallet names are saved in `wallet_names.json`, with old card
-names used as the migration fallback. A wallet's name is shared with the signer manager, so the
+also accept seed IDs; a seed wallet forgotten here is forgotten in the signer manager as well.
+Seed wallet names are saved in `wallet_names.json`, with old card names used as the migration
+fallback. A wallet's name is shared with the signer manager, so the
 Signer and keys apps show the same one (see docs/specs.md, "One name per wallet"). Pairing,
 trust and PIN handling remain per card.
 Re-exporting an existing account keeps its label. A seed change creates a different group.
