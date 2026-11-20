@@ -84,7 +84,8 @@ every app, with the public key at `m/1280263247'/n'`, which every holder of the 
 - **At add**, in the same PIN session, the card exports the key at `m/1280263247'/0'`, and the module
   registers the seed with the manager: `enroll_seed({ seed, kind: "keycard", unlockKey, name })`
   through `logos.wallets/1` (`wallets.lidl`), bound to `signer_manager_module` at runtime and asked
-  without waiting. A card that won't export it still adds; its wallet then unlocks by a password.
+  without waiting. The manager loads lazily, so until it answers, the module asks again every 10 s
+  for the rest of the run (the unlock key is kept in memory only), then opens the seed's accounts. A card that won't export it still adds; its wallet then unlocks by a password.
 - **`unlock_key`** (`{ seed, index, secret }`, the secret being the PIN, the manager alone) opens the
   card in the reader holding that key UID, verifies the PIN, checks that the master public key is
   that seed's, and exports the key at `m/1280263247'/<index>'`. It returns a job once the PIN is

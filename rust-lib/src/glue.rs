@@ -4,7 +4,8 @@
 //! Every reply is a JSON string: `{ "ok": true, ... }` or `{ "ok": false, "error": "...", "code"? }`.
 //! A request that carries a PIN, PUK or pairing password is wiped once read.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::MutexGuard;
 use std::time::Duration;
 
 use logos_signer_interface::json as signer_json;
@@ -18,8 +19,8 @@ use crate::signer::{
 };
 use crate::store::Store;
 use logos_signer_interface::wallets::{
-    name_steps, read_data_key, read_forgotten, read_wallets, DataKey, DataKeyRequest, ForgetSeed,
-    NameSeed, NameStep, Wallet,
+    name_steps, read_data_key, read_enrolled, read_forgotten, read_wallets, DataKey,
+    DataKeyRequest, ForgetSeed, NameSeed, NameStep, Wallet,
 };
 
 pub trait KeycardModule: Send + Sync + 'static {
@@ -99,18 +100,20 @@ struct Emit;
 
 impl Events for Emit {
     /// The seed goes to the signer manager while its unlock key is at hand, so the person never
-    /// unlocks it a second time. Asked without waiting: without a manager the add stands.
+    /// unlocks it a second time. Asked without waiting, and again until the manager answers.
     fn seed_added(&self, seed: &str, unlock_key: Option<[u8; 33]>, name: &str) {
         let body = zeroize::Zeroizing::new(
             json!({ "seed": seed, "kind": "keycard", "unlockKey": unlock_key.map(hex::encode), "name": name })
                 .to_string(),
         );
-        wallets::WalletsClient::bind(WALLETS).enroll_seed_async(&body, |_| {});
+        unsent().insert(seed.to_string(), body.clone());
+        enroll(seed.to_string(), body, || {});
     }
     fn seed_named(&self, seed: &str, name: &str) {
         send_name(seed, name);
     }
     fn seed_forgotten(&self, seed: &str) {
+        unsent().remove(seed);
         forget_seed(seed);
     }
     fn sign_progress(&self, job: &str, state: JobState) {
@@ -128,10 +131,63 @@ impl Events for Emit {
     }
 }
 
+/// Enrollments the signer manager hasn't answered, for this run: it loads lazily, after the add.
+static UNSENT: std::sync::Mutex<BTreeMap<String, zeroize::Zeroizing<String>>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+fn unsent() -> MutexGuard<'static, BTreeMap<String, zeroize::Zeroizing<String>>> {
+    UNSENT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Ask the manager to enroll a seed; `answered` runs once it replied, refusing or not.
+fn enroll(
+    seed: String,
+    body: zeroize::Zeroizing<String>,
+    answered: impl FnOnce() + Send + 'static,
+) {
+    let client = wallets::WalletsClient::bind(WALLETS);
+    client.enroll_seed_async_with_timeout(&body.clone(), Duration::from_secs(10), move |r| {
+        let Ok(reply) = r else { return };
+        if let Err(e) = read_enrolled(&reply) {
+            eprintln!(
+                "keycard_module: the signer manager refused a wallet: {}",
+                e.message
+            );
+        }
+        let mut u = unsent();
+        if u.get(&seed).is_some_and(|b| *b == body) {
+            u.remove(&seed);
+        }
+        drop(u);
+        answered();
+    });
+}
+
+/// Send unanswered enrollments again until the manager is up, then open what they unlock.
+fn resend_enrollments(keycard: KeycardSigner) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(10));
+        let due: Vec<_> = unsent()
+            .iter()
+            .map(|(s, b)| (s.clone(), b.clone()))
+            .collect();
+        for (seed, body) in due {
+            let (tx, rx) = std::sync::mpsc::channel();
+            enroll(seed, body, move || {
+                let _ = tx.send(());
+            });
+            if rx.recv_timeout(Duration::from_secs(15)).is_ok() {
+                open_wallets(&keycard);
+            }
+        }
+    });
+}
+
 /// A wallet's accounts open with this module's key for them, which the signer manager gives once
 /// the person unlocks the wallet in the Signer app, and close when it locks. Asked from threads
 /// of their own, never while answering the manager, which would wait on itself.
 fn watch_wallets(keycard: KeycardSigner) {
+    resend_enrollments(keycard.clone());
     let mut client = wallets::WalletsClient::bind(WALLETS);
     let changed = client.on_wallets_changed();
     let locked = client.on_wallets_locked();
