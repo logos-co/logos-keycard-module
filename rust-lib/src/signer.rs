@@ -1064,6 +1064,22 @@ impl KeycardSigner {
         lock(&self.s.cards).clone()
     }
 
+    /// Every connected reader, and whether it holds a card: `[{ reader, card }]`.
+    pub fn readers(&self) -> Vec<serde_json::Value> {
+        self.s.refresh_if_idle();
+        let cards = lock(&self.s.cards);
+        let mut names = self.s.readers.readers();
+        names.extend(cards.iter().map(|p| p.reader.clone()));
+        names.sort();
+        names.dedup();
+        names
+            .into_iter()
+            .map(
+                |r| serde_json::json!({ "reader": r, "card": cards.iter().any(|p| p.reader == r) }),
+            )
+            .collect()
+    }
+
     /// Origins for offered accounts, including absent cards and shared seeds. Public only.
     pub fn account_origins(&self) -> HashMap<String, serde_json::Value> {
         let store = lock(&self.s.store);
@@ -1198,21 +1214,11 @@ impl KeycardSigner {
         Ok(())
     }
 
-    /// Forget an absent card's local records. Reinserting it identifies it as a new card.
+    /// Forget a seed wallet's local records, its cards inserted or not (nothing on them changes),
+    /// or an absent card's. Reinserting a card identifies it as a new card.
     pub fn forget_saved_card(&self, id: &str) -> Result<(), SignerError> {
         if let Some(uid) = id.strip_prefix("seed:") {
             let _hold = self.s.hold()?;
-            self.s.refresh_cards();
-            if lock(&self.s.cards).iter().any(|p| {
-                p.card
-                    .as_ref()
-                    .is_some_and(|c| c.key_uid.as_deref() == Some(uid))
-            }) {
-                return Err(err(
-                    ErrorCode::Invalid,
-                    "Remove this wallet's Keycards from their readers before forgetting it.",
-                ));
-            }
             let gone = lock(&self.s.store)
                 .forget_wallet(uid)
                 .map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
@@ -2134,6 +2140,62 @@ mod grouping_tests {
         // A wallet the store never had isn't the manager's business.
         signer.forget_saved_card("seed:seed-x").unwrap();
         assert_eq!(*told.lock().unwrap(), vec!["seed-a", "seed-c"]);
+    }
+
+    #[test]
+    fn a_seed_wallet_is_forgotten_with_its_card_inserted() {
+        let mut store = Store::new();
+        store.remember_cards(&[card("a", "seed-a", false)]).unwrap();
+        store.put(vec![offered()]).unwrap();
+        let told = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let signer = KeycardSigner::new(Box::new(NoReaders), store, Box::new(Forgot(told.clone())));
+        *lock(&signer.s.cards) = vec![Present {
+            reader: "reader".into(),
+            epoch: Some(1),
+            card: Some(card("a", "seed-a", false)),
+            paired: true,
+            error: None,
+            untrusted: None,
+        }];
+        signer.forget_saved_card("seed:seed-a").unwrap();
+        assert!(lock(&signer.s.store).list().is_empty());
+        assert_eq!(*told.lock().unwrap(), vec!["seed-a"]);
+    }
+
+    #[test]
+    fn readers_tell_an_empty_reader_from_one_with_a_card() {
+        struct TwoReaders;
+        impl Readers for TwoReaders {
+            fn present(&self) -> Vec<Slot> {
+                vec![]
+            }
+            fn readers(&self) -> Vec<String> {
+                vec!["empty".into(), "full".into()]
+            }
+            fn connect(&self, _: &str, _: bool) -> Result<Channel, String> {
+                Err("offline".into())
+            }
+            fn trusted_cas(&self) -> Vec<[u8; 33]> {
+                vec![]
+            }
+        }
+        let signer = KeycardSigner::new(Box::new(TwoReaders), Store::new(), Box::new(Quiet));
+        signer.s.busy.store(true, Ordering::SeqCst);
+        *lock(&signer.s.cards) = vec![Present {
+            reader: "full".into(),
+            epoch: Some(1),
+            card: Some(card("a", "seed-a", false)),
+            paired: true,
+            error: None,
+            untrusted: None,
+        }];
+        assert_eq!(
+            signer.readers(),
+            vec![
+                serde_json::json!({ "reader": "empty", "card": false }),
+                serde_json::json!({ "reader": "full", "card": true }),
+            ]
+        );
     }
 
     #[test]

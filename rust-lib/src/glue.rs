@@ -42,6 +42,8 @@ pub trait KeycardModule: Send + Sync + 'static {
     /// The readers holding a card, and what each card tells before its PIN:
     /// `{ ok, cards: [{ reader, version?, initialized?, keyUid?, secureChannel?, pinRetries?, taproot?, identity?, trustedByPerson?, paired, error?, untrusted? }] }`.
     fn cards(&self) -> String;
+    /// Every connected reader, empty or not: `{ ok, readers: [{ reader, card }] }`.
+    fn readers(&self) -> String;
     /// Physical card administration; see README for the strict action schema. Secrets are transient.
     fn administer(&self, params_json: String) -> String;
     /// Remembered cards with local names and their offered accounts: `{ ok, groups: [...] }`.
@@ -50,7 +52,8 @@ pub trait KeycardModule: Send + Sync + 'static {
     fn account_previews(&self, accounts_json: String) -> String;
     /// Set a local card name (empty restores the default): `{ ok }`.
     fn rename_card(&self, id: String, name: String) -> String;
-    /// Forget an absent card: its local name, exclusive offers, pairing and trust.
+    /// Forget a seed wallet (`seed:<keyUid>`, its cards may stay inserted), or an absent card: its
+    /// local name, exclusive offers, pairing and trust.
     fn forget_saved_card(&self, id: String) -> String;
     /// Export accounts once the card's PIN opens it:
     /// `{ families | entries, chain?, account?, label?, reader?, pin, preview?, fromPreview? }` → `{ ok, job }`.
@@ -447,6 +450,10 @@ impl KeycardModule for KeycardModuleImpl {
 
     fn cards(&self) -> String {
         json!({ "ok": true, "cards": self.keycard.cards() }).to_string()
+    }
+
+    fn readers(&self) -> String {
+        json!({ "ok": true, "readers": self.keycard.readers() }).to_string()
     }
 
     fn administer(&self, mut params_json: String) -> String {
