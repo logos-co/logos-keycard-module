@@ -146,6 +146,8 @@ For the Keycard's app:
   `secureChannel` is 1 for a 3.x card and 2 for a 4.0 one; only a 4.0 card tells `pinRetries`
   before its PIN. `identity` is a 4.0 card's identity key; `untrusted` is the identity key of a
   card refused because Keycard didn't sign it.
+- `readers`: every connected reader, `{ ok, readers: [{ reader, card }] }`, so an empty reader can
+  be told from no reader. `pukRetries` needs a secure channel: `administer`'s `status` gives it.
 - `add_accounts`: `{ families, chain?, account?, label?, reader?, cardId?, pin }` → `{ ok, job }`, once the PIN
   is verified. `chain` is `main` or `test`, `test` by default; `reader` is needed only when more
   than one holds a Keycard. `cardId` optionally pins the physical identity and is checked before PIN verification.
@@ -256,8 +258,9 @@ keeps its saved label; conflicting full public keys cannot overwrite an existing
   wallet it holds that is `named`, without sending it back. For one not named yet, it sends its own
   name, the wallet's or else its card's, once a run.
 
-`forget_saved_card(seedId)` removes a disconnected seed wallet's offers, name and seed
-associations while retaining physical pairing/trust metadata. For compatibility, passing
+`forget_saved_card(seedId)` removes a seed wallet's offers, name and seed associations while
+retaining physical pairing/trust metadata. Its card may stay inserted: the wallet then shows again
+with no accounts, as a card not added yet. For compatibility, passing
 a physical card ID retains the previous card-specific forget behavior (name, pairing,
 trust and exclusive offers). `forget_card(identity)` only revokes trust. None of these
 operations erase card keys or pairing slots. Partial disk cleanup failures are surfaced.
