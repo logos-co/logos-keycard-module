@@ -240,9 +240,16 @@ root export. Multiple cards with the same seed form one wallet with multiple con
 Old account files already carry key UIDs and migrate without another PIN/export.
 
 Physical IDs remain `instance:<instanceUid>` on 3.x and `identity:<compressed identity key>`
-on 4.0. They are used for pairing, trust and PIN checks. `cards.json` retains these IDs,
-old names and observed key UIDs. Uninitialized cards with no seed still use a physical-ID
-group until a seed exists. A card with changed keys does not mark its old wallet available.
+on 4.0. They are used for pairing, trust and PIN checks. Uninitialized cards with no seed still
+use a physical-ID group until a seed exists. A card with changed keys does not mark its old wallet
+available.
+
+**Only what the person committed is written down.** `cards.json` keeps a card only if the person
+named it, or it holds a wallet with accounts here, and then only those wallets' key UIDs. A card
+merely inserted is shown from memory while it is in a reader (so its accounts can be added) and
+leaves no record once it is out. Keeping accounts writes their card down at once. Records an
+earlier run kept beyond this are dropped when the store opens. Pairings stay in `pairings.json`
+regardless, so a re-inserted 3.x card doesn't use up another pairing slot.
 
 `rename_card(id, name)` accepts either a seed wallet ID or physical card ID. Wallet names
 are stored in `wallet_names.json`; the first existing nonempty card name is the migration
@@ -260,7 +267,8 @@ keeps its saved label; conflicting full public keys cannot overwrite an existing
 
 `forget_saved_card(seedId)` removes a seed wallet's offers, name and seed associations while
 retaining physical pairing/trust metadata. Its card may stay inserted: the wallet then shows again
-with no accounts, as a card not added yet. For compatibility, passing
+with no accounts, as a card not added yet, and once the card is out nothing of the wallet is left.
+For compatibility, passing
 a physical card ID retains the previous card-specific forget behavior (name, pairing,
 trust and exclusive offers). `forget_card(identity)` only revokes trust. None of these
 operations erase card keys or pairing slots. Partial disk cleanup failures are surfaced.
@@ -271,8 +279,8 @@ then sends `forget_seed({ seed: keyUid })` (`logos.wallets/1`), asked without wa
 drops this holder, and the wallet once no holder is left. A wallet another remembered card still
 holds stays. A failed forget sends nothing, and a refusal is only logged.
 - On each read of `wallets()`, the module also forgets, once a run, each wallet the manager lists
-  it holding that it no longer has: no accounts, sealed or open, and no remembered card with that
-  key UID. So a wallet forgotten before this goes too.
+  it holding that it no longer has: no accounts, sealed or open. A card having held its seed doesn't
+  count. So a wallet forgotten before this goes too.
 - Only a store read from an earlier run's files counts. One that failed to load, or found none of
   `accounts.sealed.json`, `cards.json` and `wallet_names.json`, forgets nothing.
 
