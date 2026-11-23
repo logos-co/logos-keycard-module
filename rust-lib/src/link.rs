@@ -59,6 +59,10 @@ impl CardChannel for Channel {
 pub trait Readers: Send + Sync {
     /// The readers holding a card now.
     fn present(&self) -> Vec<Slot>;
+    /// Every connected reader, empty or not.
+    fn readers(&self) -> Vec<String> {
+        self.present().into_iter().map(|s| s.reader).collect()
+    }
     /// A session with the card in `reader`; `keep` leaves the card as it is when the session ends.
     fn connect(&self, reader: &str, keep: bool) -> Result<Channel, String>;
     /// The CAs a 4.0 card's identity must be signed by.
@@ -228,6 +232,15 @@ impl Default for Pcsc {
 
 #[cfg(feature = "pcsc")]
 impl Readers for Pcsc {
+    fn readers(&self) -> Vec<String> {
+        self.with_ctx(|ctx| match ctx.list_readers_owned() {
+            Ok(r) => Ok(r.iter().map(|n| n.to_string_lossy().into_owned()).collect()),
+            Err(pcsc::Error::NoReadersAvailable) => Ok(Vec::new()),
+            Err(e) => Err(e),
+        })
+        .unwrap_or_default()
+    }
+
     fn present(&self) -> Vec<Slot> {
         self.with_ctx(|ctx| {
             let readers = match ctx.list_readers_owned() {
