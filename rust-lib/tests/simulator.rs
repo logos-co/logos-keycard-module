@@ -1156,3 +1156,29 @@ fn the_card_gives_its_phrases_unlock_key_after_its_pin_and_only_for_its_seed() {
         ErrorCode::WrongSeed
     );
 }
+
+#[test]
+fn a_store_on_a_disk_it_cannot_write_still_opens() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("keycard-readonly-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // An earlier run's record of a card nobody named, holding a seed with no accounts here:
+    // the cleanup on open drops it.
+    let leftover = r#"{"cards":[{"id":"card-1","name":"","version":"3.1","keyUids":["seed-1"]}]}"#;
+    std::fs::write(dir.join("cards.json"), leftover).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    // The cleanup can't be written, but opening doesn't fail: the cleaned list holds in memory.
+    let mut store = Store::open(&dir).expect("opens on a disk it can't write");
+    assert!(store.cards().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("cards.json")).unwrap(),
+        leftover
+    );
+    // Once the disk takes writes again, the next save writes the cleaned list.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    store.remember_cards(&[]).unwrap();
+    let saved = std::fs::read_to_string(dir.join("cards.json")).unwrap();
+    assert!(!saved.contains("card-1"), "{saved}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

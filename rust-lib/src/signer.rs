@@ -27,7 +27,7 @@ use crate::accounts::{self, parse_path, EVM_PATH, HARDENED};
 use crate::answers;
 use crate::card::{Card, CardError, CardInfo};
 use crate::link::Readers;
-use crate::store::{Offered, Store};
+use crate::store::{Offered, SavedCard, Store};
 
 /// How long a call waits for the card to check a PIN.
 const PIN_PATIENCE: Duration = Duration::from_secs(90);
@@ -493,6 +493,15 @@ impl Shared {
         lock(&self.store)
             .put(offered)
             .map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
+        // The wallet's card is in a reader now: write it down with the wallet at once, so the
+        // wallet keeps its card even if the card leaves before the readers are next looked at.
+        let present: Vec<CardInfo> = lock(&self.cards)
+            .iter()
+            .filter_map(|p| p.card.clone())
+            .collect();
+        if let Err(e) = lock(&self.store).remember_cards(&present) {
+            eprintln!("keycard_module: could not remember cards: {e}");
+        }
         if let Some(seed) = seed {
             let name = Some(lock(&self.store).wallet_name(&seed))
                 .filter(|n| !n.is_empty())
@@ -1101,7 +1110,28 @@ impl KeycardSigner {
         let present = lock(&self.s.cards).clone();
         let store = lock(&self.s.store);
         let mut groups = std::collections::BTreeMap::<String, CardGroup>::new();
-        for saved in store.cards() {
+        // The cards written down, plus what is in a reader now: a card merely inserted is shown
+        // (to add its accounts) from memory only, and the seed it holds joins its card while it's in.
+        let mut known: Vec<SavedCard> = store.cards().to_vec();
+        for c in present.iter().filter_map(|p| p.card.as_ref()) {
+            let Some(id) = c.id() else { continue };
+            match known.iter_mut().find(|s| s.id == id) {
+                Some(s) => {
+                    if let Some(uid) = &c.key_uid {
+                        if !s.key_uids.contains(uid) {
+                            s.key_uids.push(uid.clone());
+                        }
+                    }
+                }
+                None => known.push(SavedCard {
+                    id,
+                    name: String::new(),
+                    version: c.version.clone(),
+                    key_uids: c.key_uid.iter().cloned().collect(),
+                }),
+            }
+        }
+        for saved in &known {
             let current = present.iter().find_map(|p| {
                 p.card
                     .as_ref()
@@ -1189,9 +1219,21 @@ impl KeycardSigner {
             }
             return Ok(());
         }
-        lock(&self.s.store)
-            .rename_card(id, name)
+        // A card in a reader that nothing keeps yet is written down by being named.
+        let inserted = lock(&self.s.cards)
+            .iter()
+            .filter_map(|p| p.card.clone())
+            .find(|c| c.id().as_deref() == Some(id));
+        {
+            let mut store = lock(&self.s.store);
+            match inserted {
+                Some(info) if !store.cards().iter().any(|c| c.id == id) => {
+                    store.name_card(&info, name)
+                }
+                _ => store.rename_card(id, name),
+            }
             .map_err(|e| err(ErrorCode::Invalid, e.to_string()))?;
+        }
         self.s
             .events
             .accounts_changed(lock(&self.s.store).list().len());
@@ -1904,8 +1946,9 @@ mod grouping_tests {
         let dir = std::env::temp_dir().join(format!("keycard-locked-group-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut store = Store::open(&dir).unwrap();
-        store.remember_cards(&[card("a", "seed-a", false)]).unwrap();
+        // The card is written down once its wallet has accounts here, not before.
         store.put(vec![offered()]).unwrap();
+        store.remember_cards(&[card("a", "seed-a", false)]).unwrap();
         store.unlock("seed-a", &key(1), &key(1)).unwrap();
         let signer = KeycardSigner::new(
             Box::new(NoReaders),
@@ -2007,20 +2050,24 @@ mod grouping_tests {
                 .as_nanos()
         ));
         let mut store = Store::open(&dir).unwrap();
-        store.remember_cards(&[card("a", "seed-a", false)]).unwrap();
-        store.rename_card("instance:a", "  Travel  ").unwrap();
+        // A card nothing keeps yet is written down by being named.
+        store
+            .name_card(&card("a", "seed-a", false), "  Travel  ")
+            .unwrap();
         drop(store);
         let mut store = Store::open(&dir).unwrap();
         store.remember_cards(&[card("a", "seed-b", false)]).unwrap();
         assert_eq!(store.cards().len(), 1);
         assert_eq!(store.cards()[0].name, "Travel");
-        assert_eq!(store.cards()[0].key_uids, vec!["seed-a", "seed-b"]);
+        // Neither seed has accounts here, so the card links to no wallet.
+        assert!(store.cards()[0].key_uids.is_empty());
         assert!(store.rename_card("instance:a", &"x".repeat(81)).is_err());
         assert!(store.rename_card("instance:a", "bad\nname").is_err());
         assert!(store.rename_card("unknown", "Oops").is_err());
         assert_eq!(store.cards()[0].name, "Travel");
         store.rename_card("instance:a", "").unwrap();
-        assert_eq!(Store::open(&dir).unwrap().cards()[0].name, "");
+        // Unnamed and holding no wallet here, nothing keeps the card any more.
+        assert!(Store::open(&dir).unwrap().cards().is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2031,6 +2078,9 @@ mod grouping_tests {
         std::fs::write(dir.join("pairings.json"), r#"{"pairings":[{"instanceUid":"a","pairing":"local-a"},{"instanceUid":"b","pairing":"local-b"}]}"#).unwrap();
         std::fs::write(dir.join("trusted_cards.json"), r#"{"cards":["c","d"]}"#).unwrap();
         let mut store = Store::open(&dir).unwrap();
+        store.put(vec![offered()]).unwrap();
+        store.unlock("seed-a", &key(1), &key(1)).unwrap();
+        // a holds a wallet with accounts; b, c and d are kept because the person named them.
         store
             .remember_cards(&[
                 card("a", "seed-a", false),
@@ -2039,9 +2089,10 @@ mod grouping_tests {
                 card("d", "seed-d", true),
             ])
             .unwrap();
-        store.put(vec![offered()]).unwrap();
-        store.unlock("seed-a", &key(1), &key(1)).unwrap();
         store.rename_card("instance:a", "Daily").unwrap();
+        store.name_card(&card("b", "seed-b", false), "B").unwrap();
+        store.name_card(&card("c", "seed-c", true), "C").unwrap();
+        store.name_card(&card("d", "seed-d", true), "D").unwrap();
         let signer = KeycardSigner::new(Box::new(NoReaders), store, Box::new(Quiet));
         signer.forget_saved_card("instance:a").unwrap();
         signer.forget_saved_card("identity:c").unwrap();
@@ -2070,10 +2121,10 @@ mod grouping_tests {
     #[test]
     fn forgetting_one_of_two_cards_preserves_the_shared_accounts() {
         let mut store = Store::new();
+        store.put(vec![offered()]).unwrap();
         store
             .remember_cards(&[card("a", "seed-a", false), card("b", "seed-a", true)])
             .unwrap();
-        store.put(vec![offered()]).unwrap();
         // The wallet stays in the manager while another card holds it.
         assert!(store.forget_saved_card("instance:a").unwrap().is_empty());
         assert_eq!(store.list().len(), 1);
@@ -2123,6 +2174,7 @@ mod grouping_tests {
     #[test]
     fn the_manager_forgets_a_wallet_with_its_last_card_or_when_it_is_forgotten() {
         let mut store = Store::new();
+        store.put(vec![offered()]).unwrap();
         store
             .remember_cards(&[
                 card("a", "seed-a", false),
@@ -2130,16 +2182,16 @@ mod grouping_tests {
                 card("c", "seed-c", false),
             ])
             .unwrap();
-        store.put(vec![offered()]).unwrap();
         let told = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let signer = KeycardSigner::new(Box::new(NoReaders), store, Box::new(Forgot(told.clone())));
         signer.forget_saved_card("instance:a").unwrap();
         assert!(told.lock().unwrap().is_empty(), "card b still holds seed-a");
         signer.forget_saved_card("identity:b").unwrap();
+        // A wallet the store never had isn't the manager's business: seed-c only sat on a card,
+        // with no accounts here, and seed-x was never seen at all.
         signer.forget_saved_card("seed:seed-c").unwrap();
-        // A wallet the store never had isn't the manager's business.
         signer.forget_saved_card("seed:seed-x").unwrap();
-        assert_eq!(*told.lock().unwrap(), vec!["seed-a", "seed-c"]);
+        assert_eq!(*told.lock().unwrap(), vec!["seed-a"]);
     }
 
     #[test]
@@ -2160,6 +2212,122 @@ mod grouping_tests {
         signer.forget_saved_card("seed:seed-a").unwrap();
         assert!(lock(&signer.s.store).list().is_empty());
         assert_eq!(*told.lock().unwrap(), vec!["seed-a"]);
+    }
+
+    fn inserted(id: &str, seed: &str) -> Present {
+        Present {
+            reader: "reader".into(),
+            epoch: Some(1),
+            card: Some(card(id, seed, false)),
+            paired: true,
+            error: None,
+            untrusted: None,
+        }
+    }
+
+    #[test]
+    fn a_card_merely_inserted_is_shown_but_leaves_no_record() {
+        let dir = scratch("inserted");
+        let signer = KeycardSigner::new(
+            Box::new(NoReaders),
+            Store::open(&dir).unwrap(),
+            Box::new(Quiet),
+        );
+        // Hold the snapshot steady, as while a real card operation is under way.
+        signer.s.busy.store(true, Ordering::SeqCst);
+        *lock(&signer.s.cards) = vec![inserted("a", "seed-a")];
+        lock(&signer.s.store)
+            .remember_cards(&[card("a", "seed-a", false)])
+            .unwrap();
+        let groups = signer.card_groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, "seed:seed-a");
+        assert!(groups[0].connected, "shown, so its accounts can be added");
+        assert!(groups[0].accounts.is_empty());
+        assert!(lock(&signer.s.store).cards().is_empty());
+        assert!(!dir.join("cards.json").exists(), "nothing written down");
+        lock(&signer.s.cards).clear();
+        assert!(signer.card_groups().is_empty(), "pulled out, nothing left");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_wallet_forgotten_with_its_card_inserted_leaves_nothing_once_the_card_is_out() {
+        let dir = scratch("forget-pulled");
+        let mut store = Store::open(&dir).unwrap();
+        store.put(vec![offered()]).unwrap();
+        store.unlock("seed-a", &key(1), &key(1)).unwrap();
+        store.remember_cards(&[card("a", "seed-a", false)]).unwrap();
+        let signer = KeycardSigner::new(Box::new(NoReaders), store, Box::new(Quiet));
+        *lock(&signer.s.cards) = vec![inserted("a", "seed-a")];
+        signer.forget_saved_card("seed:seed-a").unwrap();
+        // The readers are looked at again while the card is still in: it is seen, not kept.
+        lock(&signer.s.store)
+            .remember_cards(&[card("a", "seed-a", false)])
+            .unwrap();
+        lock(&signer.s.cards).clear();
+        assert!(signer.card_groups().is_empty());
+        let store = Store::open(&dir).unwrap();
+        assert!(store.cards().is_empty());
+        assert!(!store.has_wallet("seed-a"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn keeping_accounts_writes_their_card_down_at_once() {
+        let dir = scratch("keep-card");
+        let signer = KeycardSigner::new(
+            Box::new(NoReaders),
+            Store::open(&dir).unwrap(),
+            Box::new(Quiet),
+        );
+        *lock(&signer.s.cards) = vec![inserted("a", "seed-a")];
+        signer.s.keep(vec![offered()], None).unwrap();
+        // Pulled out before the readers were looked at again: the wallet still has its card.
+        lock(&signer.s.cards).clear();
+        let cards = lock(&signer.s.store).cards().to_vec();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].key_uids, vec!["seed-a"]);
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("cards.json")).unwrap()).unwrap();
+        assert_eq!(on_disk["cards"][0]["id"], "instance:a");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_earlier_runs_leftover_cards_are_dropped_on_open() {
+        let dir = scratch("leftovers");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("cards.json"),
+            r#"{"cards":[
+                {"id":"instance:old","name":"","version":"3.1","keyUids":["seed-old"]},
+                {"id":"instance:bare","name":"","version":"3.1","keyUids":[]},
+                {"id":"instance:named","name":"Travel","version":"3.1","keyUids":["seed-old"]}
+            ]}"#,
+        )
+        .unwrap();
+        let store = Store::open(&dir).unwrap();
+        assert_eq!(store.cards().len(), 1, "only the card the person named");
+        assert_eq!(store.cards()[0].name, "Travel");
+        assert!(
+            store.cards()[0].key_uids.is_empty(),
+            "seed-old has no accounts here"
+        );
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("cards.json")).unwrap()).unwrap();
+        assert_eq!(on_disk["cards"].as_array().unwrap().len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn naming_an_inserted_card_keeps_it() {
+        let signer = KeycardSigner::new(Box::new(NoReaders), Store::new(), Box::new(Quiet));
+        *lock(&signer.s.cards) = vec![inserted("a", "seed-a")];
+        signer.rename_card("instance:a", "Travel").unwrap();
+        lock(&signer.s.cards).clear();
+        let cards = lock(&signer.s.store).cards().to_vec();
+        assert_eq!((cards.len(), cards[0].name.as_str()), (1, "Travel"));
     }
 
     #[test]
@@ -2202,8 +2370,8 @@ mod grouping_tests {
     fn a_failed_forget_tells_the_manager_nothing_until_it_is_retried() {
         let dir = scratch("forget-told");
         let mut store = Store::open(&dir).unwrap();
-        store.remember_cards(&[card("a", "seed-a", false)]).unwrap();
         store.put(vec![offered()]).unwrap();
+        store.remember_cards(&[card("a", "seed-a", false)]).unwrap();
         std::fs::remove_file(dir.join("cards.json")).unwrap();
         std::fs::create_dir(dir.join("cards.json")).unwrap();
         let told = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2220,7 +2388,9 @@ mod grouping_tests {
     fn stale_wallets_are_the_held_ones_the_store_no_longer_has() {
         let dir = scratch("stale");
         let mut store = Store::open(&dir).unwrap();
-        // seed-a: sealed accounts and no card; seed-b: a card and no accounts; seed-c: shared.
+        // seed-a: sealed accounts and no card. seed-b and seed-c were only ever seen on cards,
+        // with no accounts here: a card having held a seed doesn't make it a wallet of this
+        // module's, so the manager's entries for them are stale too.
         store.put(vec![offered()]).unwrap();
         store.unlock("seed-a", &key(1), &key(1)).unwrap();
         store
@@ -2230,13 +2400,13 @@ mod grouping_tests {
                 card("c2", "seed-c", true),
             ])
             .unwrap();
-        store.forget_saved_card("instance:c1").unwrap();
         drop(store);
         let store = Store::open(&dir).unwrap();
         let all = listed(&["seed-a", "seed-b", "seed-c", "seed-gone", " seed-d "]);
-        assert_eq!(store.stale(&all), vec!["seed-gone", "seed-d"]);
+        let stale = vec!["seed-b", "seed-c", "seed-gone", "seed-d"];
+        assert_eq!(store.stale(&all), stale);
         let signer = KeycardSigner::new(Box::new(NoReaders), store, Box::new(Quiet));
-        assert_eq!(signer.stale_wallets(&all), vec!["seed-gone", "seed-d"]);
+        assert_eq!(signer.stale_wallets(&all), stale);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2293,8 +2463,8 @@ mod grouping_tests {
             }
         }
         let mut store = Store::new();
-        store.remember_cards(&[card("a", "seed-a", false)]).unwrap();
         store.put(vec![offered()]).unwrap();
+        store.remember_cards(&[card("a", "seed-a", false)]).unwrap();
         let signer = KeycardSigner::new(Box::new(Inserted), store, Box::new(Quiet));
         *lock(&signer.s.cards) = vec![Present {
             reader: "reader".into(),
@@ -2323,8 +2493,8 @@ mod grouping_tests {
     fn failed_forget_keeps_the_card_visible_for_retry() {
         let dir = std::env::temp_dir().join(format!("keycard-forget-fail-{}", std::process::id()));
         let mut store = Store::open(&dir).unwrap();
-        store.remember_cards(&[card("a", "seed-a", false)]).unwrap();
         store.put(vec![offered()]).unwrap();
+        store.remember_cards(&[card("a", "seed-a", false)]).unwrap();
         std::fs::remove_file(dir.join("cards.json")).unwrap();
         std::fs::create_dir(dir.join("cards.json")).unwrap();
         assert!(store.forget_saved_card("instance:a").is_err());
@@ -2340,8 +2510,9 @@ mod grouping_tests {
     fn failed_save_does_not_change_the_name_in_memory() {
         let dir = std::env::temp_dir().join(format!("keycard-save-fail-{}", std::process::id()));
         let mut store = Store::open(&dir).unwrap();
-        store.remember_cards(&[card("a", "seed-a", false)]).unwrap();
-        store.rename_card("instance:a", "Original").unwrap();
+        store
+            .name_card(&card("a", "seed-a", false), "Original")
+            .unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::write(&dir, "not a directory").unwrap();
         assert!(store.rename_card("instance:a", "Lost").is_err());

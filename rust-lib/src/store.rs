@@ -72,6 +72,8 @@ pub struct Store {
     paired: Vec<Paired>,
     trusted: Vec<String>,
     cards: Vec<SavedCard>,
+    /// `cards` differs from `cards.json`: the cleanup on open couldn't write, so the next save does.
+    cards_unsaved: bool,
     wallet_names: BTreeMap<String, String>,
     /// Read from files a run before this one wrote: only then does a missing wallet mean forgotten.
     found: bool,
@@ -115,6 +117,7 @@ impl Default for Store {
             paired: Vec::new(),
             trusted: Vec::new(),
             cards: Vec::new(),
+            cards_unsaved: false,
             wallet_names: BTreeMap::new(),
             found: false,
         }
@@ -137,7 +140,7 @@ impl Store {
         let paired = read::<Pairings>(&dir.join("pairings.json"))?.pairings;
         let trusted = read::<Trusted>(&dir.join("trusted_cards.json"))?.cards;
         let cards = read::<SavedCards>(&dir.join("cards.json"))?.cards;
-        Ok(Store {
+        let mut store = Store {
             dir: Some(dir.clone()),
             docs,
             offered: Vec::new(),
@@ -145,13 +148,24 @@ impl Store {
             paired,
             trusted,
             wallet_names: read(&dir.join("wallet_names.json"))?,
-            cards,
+            cards: cards.clone(),
+            cards_unsaved: false,
             found,
-        })
+        };
+        // Earlier runs remembered every card they saw, and every seed on it: drop what nobody
+        // committed, so a wallet forgotten then leaves nothing behind once its card is out.
+        // Best effort: opening must not fail on a disk it can't write (read-only, full). The
+        // cleaned list holds in memory, and the next save writes it.
+        if let Err(e) = store.save_cards(cards.clone()) {
+            eprintln!("keycard_module: could not write the cleaned card list yet: {e}");
+            store.cards = store.keepable(cards);
+            store.cards_unsaved = true;
+        }
+        Ok(store)
     }
 
-    /// Whether anything of a wallet is kept here: its accounts, sealed, open or waiting, or a
-    /// remembered card with its key UID. Its name alone doesn't count.
+    /// Whether anything of a wallet is kept here: its accounts, sealed, open or waiting. Its name
+    /// alone doesn't count, nor does a card having held its seed.
     pub fn has_wallet(&self, uid: &str) -> bool {
         self.docs.seeds().iter().any(|s| s == uid)
             || self
@@ -159,10 +173,19 @@ impl Store {
                 .iter()
                 .chain(&self.waiting)
                 .any(|o| o.key_uid == uid)
-            || self
-                .cards
-                .iter()
-                .any(|c| c.key_uids.iter().any(|k| k == uid))
+    }
+
+    /// The cards worth writing down: one the person named, or one holding a wallet that has
+    /// accounts here, with only those wallets' key UIDs. A card merely inserted is shown from
+    /// memory while it is in a reader and leaves no record.
+    fn keepable(&self, cards: Vec<SavedCard>) -> Vec<SavedCard> {
+        cards
+            .into_iter()
+            .filter_map(|mut c| {
+                c.key_uids.retain(|u| self.has_wallet(u));
+                (!c.name.is_empty() || !c.key_uids.is_empty()).then_some(c)
+            })
+            .collect()
     }
 
     /// The wallets the signer manager lists this module holding that the store no longer has.
@@ -248,7 +271,8 @@ impl Store {
         &self.cards
     }
 
-    /// Remember only successfully identified cards. Do not derive physical identity from a seed.
+    /// Merge the identified cards present into the list; [`Store::save_cards`] keeps, and writes
+    /// down, only the ones worth keeping. Do not derive physical identity from a seed.
     pub fn remember_cards(&mut self, present: &[CardInfo]) -> std::io::Result<()> {
         let mut next = self.cards.clone();
         for info in present {
@@ -292,6 +316,30 @@ impl Store {
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "unknown card"))?;
         card.name = name.into();
         self.save_cards(next)
+    }
+
+    /// Name a card in a reader that nothing here keeps yet: the name is what keeps it.
+    pub fn name_card(&mut self, info: &CardInfo, name: &str) -> std::io::Result<()> {
+        let id = info
+            .id()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "unknown card"))?;
+        let before = self.cards.clone();
+        if !self.cards.iter().any(|c| c.id == id) {
+            let mut next = self.cards.clone();
+            next.push(SavedCard {
+                id: id.clone(),
+                name: String::new(),
+                version: info.version.clone(),
+                key_uids: info.key_uid.iter().cloned().collect(),
+            });
+            // Not written yet: unnamed, it isn't kept. rename_card writes it with its name.
+            self.cards = next;
+        }
+        let named = self.rename_card(&id, name);
+        if named.is_err() {
+            self.cards = before;
+        }
+        named
     }
 
     /// Forget local records, retaining offers also associated with another remembered card.
@@ -366,7 +414,8 @@ impl Store {
     }
 
     fn save_cards(&mut self, next: Vec<SavedCard>) -> std::io::Result<()> {
-        if next == self.cards {
+        let next = self.keepable(next);
+        if next == self.cards && !self.cards_unsaved {
             return Ok(());
         }
         if let Some(dir) = &self.dir {
@@ -376,6 +425,7 @@ impl Store {
             write(&dir.join("cards.json"), &body)?;
         }
         self.cards = next;
+        self.cards_unsaved = false;
         Ok(())
     }
 
