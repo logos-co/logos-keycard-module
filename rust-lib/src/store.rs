@@ -72,6 +72,8 @@ pub struct Store {
     paired: Vec<Paired>,
     trusted: Vec<String>,
     cards: Vec<SavedCard>,
+    /// `cards` differs from `cards.json`: the cleanup on open couldn't write, so the next save does.
+    cards_unsaved: bool,
     wallet_names: BTreeMap<String, String>,
     /// Read from files a run before this one wrote: only then does a missing wallet mean forgotten.
     found: bool,
@@ -115,6 +117,7 @@ impl Default for Store {
             paired: Vec::new(),
             trusted: Vec::new(),
             cards: Vec::new(),
+            cards_unsaved: false,
             wallet_names: BTreeMap::new(),
             found: false,
         }
@@ -146,11 +149,18 @@ impl Store {
             trusted,
             wallet_names: read(&dir.join("wallet_names.json"))?,
             cards: cards.clone(),
+            cards_unsaved: false,
             found,
         };
         // Earlier runs remembered every card they saw, and every seed on it: drop what nobody
         // committed, so a wallet forgotten then leaves nothing behind once its card is out.
-        store.save_cards(cards)?;
+        // Best effort: opening must not fail on a disk it can't write (read-only, full). The
+        // cleaned list holds in memory, and the next save writes it.
+        if let Err(e) = store.save_cards(cards.clone()) {
+            eprintln!("keycard_module: could not write the cleaned card list yet: {e}");
+            store.cards = store.keepable(cards);
+            store.cards_unsaved = true;
+        }
         Ok(store)
     }
 
@@ -261,7 +271,8 @@ impl Store {
         &self.cards
     }
 
-    /// Remember only successfully identified cards. Do not derive physical identity from a seed.
+    /// Merge the identified cards present into the list; [`Store::save_cards`] keeps, and writes
+    /// down, only the ones worth keeping. Do not derive physical identity from a seed.
     pub fn remember_cards(&mut self, present: &[CardInfo]) -> std::io::Result<()> {
         let mut next = self.cards.clone();
         for info in present {
@@ -404,7 +415,7 @@ impl Store {
 
     fn save_cards(&mut self, next: Vec<SavedCard>) -> std::io::Result<()> {
         let next = self.keepable(next);
-        if next == self.cards {
+        if next == self.cards && !self.cards_unsaved {
             return Ok(());
         }
         if let Some(dir) = &self.dir {
@@ -414,6 +425,7 @@ impl Store {
             write(&dir.join("cards.json"), &body)?;
         }
         self.cards = next;
+        self.cards_unsaved = false;
         Ok(())
     }
 
